@@ -1,1290 +1,795 @@
 package main
 
 import (
-	"bufio"
 	"encoding/xml"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
+	"io/ioutil"
+	"log"
 	"os"
-	"regexp"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
+	"time"
 )
 
-// TODO: FIX DUPLICATE ENUM VALUES THAT CAUSE ERROR (duplicate key 1 in map literal)
-// usage go run main.go -in sap-metadata.xml -out models_gen.go -pkg models
+// Usage examples:
+//   Split per type (recommended):
+//     go run main.go -input="metadata.xml" -outDir="./types" -split="perType"
+//   Single file (legacy):
+//     go run main.go -input="metadata.xml" -output="types.ts" -split="single"
 
-type Options struct {
-	PkgName      string
-	DecimalMode  string // "shopspring" or "string"
-	NsPrefixMode string // "auto", "always", "none"
-	InPath       string
-	OutPath      string
+// (Same XML parsing structs as before - unchanged for SAP B1 compatibility)
+type EDMX struct {
+	XMLName      xml.Name     `xml:"http://docs.oasis-open.org/odata/ns/edmx Edmx"`
+	Version      string       `xml:"Version,attr"`
+	DataServices DataServices `xml:"http://docs.oasis-open.org/odata/ns/edmx DataServices"`
 }
 
-func main() {
-	opts := parseFlags()
-	if err := run(opts); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
+type DataServices struct {
+	XMLName xml.Name `xml:"http://docs.oasis-open.org/odata/ns/edmx DataServices"`
+	Schemas []Schema `xml:"http://docs.oasis-open.org/odata/ns/edm Schema"`
 }
-
-func strconvQuote(s string) string { return strconv.Quote(s) }
-
-func parseFlags() Options {
-	var opts Options
-	flag.StringVar(&opts.InPath, "in", "", "input metadata XML file (default: stdin)")
-	flag.StringVar(&opts.OutPath, "out", "",
-		"output Go file (default: stdout)")
-	flag.StringVar(&opts.PkgName, "pkg", "models", "package name for generated code")
-	flag.StringVar(&opts.DecimalMode, "decimal", "shopspring",
-		"decimal mode: shopspring | string")
-	flag.StringVar(&opts.NsPrefixMode, "ns-prefix", "auto",
-		"namespace prefix mode: auto | always | none")
-	flag.Parse()
-	opts.DecimalMode = strings.ToLower(opts.DecimalMode)
-	switch opts.DecimalMode {
-	case "shopspring", "string":
-	default:
-		fmt.Fprintf(os.Stderr,
-			"warning: -decimal=%q invalid; falling back to shopspring\n",
-			opts.DecimalMode)
-		opts.DecimalMode = "shopspring"
-	}
-	opts.NsPrefixMode = strings.ToLower(opts.NsPrefixMode)
-	switch opts.NsPrefixMode {
-	case "auto", "always", "none":
-	default:
-		fmt.Fprintf(os.Stderr,
-			"warning: -ns-prefix=%q invalid; falling back to auto\n",
-			opts.NsPrefixMode)
-		opts.NsPrefixMode = "auto"
-	}
-	return opts
-}
-
-func run(opts Options) error {
-	in := os.Stdin
-	var err error
-	if opts.InPath != "" {
-		in, err = os.Open(opts.InPath)
-		if err != nil {
-			return fmt.Errorf("open input: %w", err)
-		}
-		defer in.Close()
-	}
-
-	schemas, err := parseEdmx(in)
-	if err != nil {
-		return fmt.Errorf("parse metadata: %w", err)
-	}
-	if len(schemas) == 0 {
-		return errors.New("no <Schema> found in metadata")
-	}
-
-	gen, err := generate(schemas, opts)
-	if err != nil {
-		return fmt.Errorf("generate: %w", err)
-	}
-
-	out := os.Stdout
-	if opts.OutPath != "" {
-		out, err = os.Create(opts.OutPath)
-		if err != nil {
-			return fmt.Errorf("create output: %w", err)
-		}
-		defer out.Close()
-	}
-	w := bufio.NewWriter(out)
-	if _, err := w.WriteString(gen); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
-	return w.Flush()
-}
-
-/* ===========================
-   Metadata model structures
-   =========================== */
 
 type Schema struct {
-	Namespace    string
-	EntityTypes  map[string]*EntityType
-	ComplexTypes map[string]*ComplexType
-	EnumTypes    map[string]*EnumType
-	Associations map[string]*Association // v3 only
+	XMLName          xml.Name          `xml:"http://docs.oasis-open.org/odata/ns/edm Schema"`
+	Namespace        string            `xml:"Namespace,attr"`
+	Alias            string            `xml:"Alias,attr,omitempty"`
+	EntityTypes      []EntityType      `xml:"http://docs.oasis-open.org/odata/ns/edm EntityType"`
+	ComplexTypes     []ComplexType     `xml:"http://docs.oasis-open.org/odata/ns/edm ComplexType"`
+	EnumTypes        []EnumType        `xml:"http://docs.oasis-open.org/odata/ns/edm EnumType"`
+	EntityContainers []EntityContainer `xml:"http://docs.oasis-open.org/odata/ns/edm EntityContainer,omitempty"`
 }
 
 type EntityType struct {
-	Namespace  string
-	Name       string
-	BaseType   string // qualified or ""
-	Keys       []string
-	Properties []*Property
-	NavPropsV4 []*NavPropertyV4
-	NavPropsV3 []*NavPropertyV3 // v3 only
+	XMLName              xml.Name             `xml:"http://docs.oasis-open.org/odata/ns/edm EntityType"`
+	Name                 string               `xml:"Name,attr"`
+	Key                  []PropertyRef        `xml:"http://docs.oasis-open.org/odata/ns/edm Key>PropertyRef"`
+	Properties           []Property           `xml:"http://docs.oasis-open.org/odata/ns/edm Property"`
+	NavigationProperties []NavigationProperty `xml:"http://docs.oasis-open.org/odata/ns/edm NavigationProperty"`
+	Base                 string               `xml:"Base,attr,omitempty"`
 }
 
 type ComplexType struct {
-	Namespace  string
-	Name       string
-	BaseType   string // qualified or ""
-	Properties []*Property
+	XMLName              xml.Name             `xml:"http://docs.oasis-open.org/odata/ns/edm ComplexType"`
+	Name                 string               `xml:"Name,attr"`
+	Properties           []Property           `xml:"http://docs.oasis-open.org/odata/ns/edm Property"`
+	NavigationProperties []NavigationProperty `xml:"http://docs.oasis-open.org/odata/ns/edm NavigationProperty"`
 }
 
 type EnumType struct {
-	Namespace  string
-	Name       string
-	Underlying string // Edm.Int32 etc (v4) or ""
-	Members    []EnumMember
-	IsFlags    bool // support flags enums (comma-separated names)
+	XMLName        xml.Name     `xml:"http://docs.oasis-open.org/odata/ns/edm EnumType"`
+	Name           string       `xml:"Name,attr"`
+	Flags          bool         `xml:"Flags,attr,omitempty"`
+	IsFlags        bool         `xml:"IsFlags,attr,omitempty"`
+	UnderlyingType string       `xml:"UnderlyingType,attr,omitempty"`
+	Members        []EnumMember `xml:"http://docs.oasis-open.org/odata/ns/edm Member"`
 }
 
 type EnumMember struct {
-	Name  string
-	Value string // keep as string to support non-int32 too
+	XMLName xml.Name `xml:"http://docs.oasis-open.org/odata/ns/edm Member"`
+	Name    string   `xml:"Name,attr"`
+	Value   string   `xml:"Value,attr,omitempty"`
 }
 
 type Property struct {
-	Name     string
-	Type     string // Edm.* or Qualified.Type or Collection(...)
-	Nullable *bool
+	XMLName      xml.Name `xml:"http://docs.oasis-open.org/odata/ns/edm Property"`
+	Name         string   `xml:"Name,attr"`
+	Type         string   `xml:"Type,attr"`
+	Nullable     bool     `xml:"Nullable,attr,omitempty"`
+	MaxLength    int      `xml:"MaxLength,attr,omitempty"`
+	Precision    int      `xml:"Precision,attr,omitempty"`
+	Scale        int      `xml:"Scale,attr,omitempty"`
+	DefaultValue string   `xml:"DefaultValue,attr,omitempty"`
 }
 
-type NavPropertyV4 struct {
-	Name     string
-	Type     string // Collection(NS.Type) or NS.Type
-	Nullable *bool
+type PropertyRef struct {
+	XMLName xml.Name `xml:"http://docs.oasis-open.org/odata/ns/edm PropertyRef"`
+	Name    string   `xml:"Name,attr"`
 }
 
-type NavPropertyV3 struct {
-	Name         string
-	Relationship string // NS.Association
-	FromRole     string
-	ToRole       string
+type NavigationProperty struct {
+	XMLName                xml.Name                `xml:"http://docs.oasis-open.org/odata/ns/edm NavigationProperty"`
+	Name                   string                  `xml:"Name,attr"`
+	Type                   string                  `xml:"Type,attr"`
+	Partner                string                  `xml:"Partner,attr,omitempty"`
+	ReferentialConstraints []ReferentialConstraint `xml:"http://docs.oasis-open.org/odata/ns/edm ReferentialConstraint,omitempty"`
 }
 
-type Association struct {
-	Namespace string
-	Name      string
-	Ends      []AssocEnd
+type ReferentialConstraint struct {
+	XMLName            xml.Name `xml:"http://docs.oasis-open.org/odata/ns/edm ReferentialConstraint"`
+	Property           string   `xml:"Property,attr"`
+	ReferencedProperty string   `xml:"ReferencedProperty,attr"`
 }
 
-type AssocEnd struct {
-	Role         string
-	Type         string // NS.Entity
-	Multiplicity string // "*", "0..1", "1"
+type EntityContainer struct {
+	XMLName    xml.Name    `xml:"http://docs.oasis-open.org/odata/ns/edm EntityContainer"`
+	Name       string      `xml:"Name,attr"`
+	EntitySets []EntitySet `xml:"http://docs.oasis-open.org/odata/ns/edm EntitySet,omitempty"`
 }
 
-/* ===========================
-   XML parsing (v3 and v4)
-   =========================== */
-
-func parseEdmx(r io.Reader) ([]*Schema, error) {
-	dec := xml.NewDecoder(r)
-	var schemas []*Schema
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-		se, ok := tok.(xml.StartElement)
-		if !ok {
-			continue
-		}
-		if se.Name.Local == "Schema" {
-			s, err := parseSchema(dec, se)
-			if err != nil {
-				return nil, err
-			}
-			schemas = append(schemas, s)
-		}
-	}
-	return schemas, nil
+type EntitySet struct {
+	XMLName    xml.Name `xml:"http://docs.oasis-open.org/odata/ns/edm EntitySet"`
+	Name       string   `xml:"Name,attr"`
+	EntityType string   `xml:"EntityType,attr"`
 }
 
-func parseSchema(dec *xml.Decoder, start xml.StartElement) (*Schema, error) {
-	s := &Schema{
-		Namespace:    attr(start, "Namespace"),
-		EntityTypes:  map[string]*EntityType{},
-		ComplexTypes: map[string]*ComplexType{},
-		EnumTypes:    map[string]*EnumType{},
-		Associations: map[string]*Association{},
-	}
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		switch tt := tok.(type) {
-		case xml.StartElement:
-			switch tt.Name.Local {
-			case "EntityType":
-				e, err := parseEntityType(dec, tt, s.Namespace)
-				if err != nil {
-					return nil, err
-				}
-				s.EntityTypes[e.Name] = e
-			case "ComplexType":
-				c, err := parseComplexType(dec, tt, s.Namespace)
-				if err != nil {
-					return nil, err
-				}
-				s.ComplexTypes[c.Name] = c
-			case "EnumType":
-				e, err := parseEnumType(dec, tt, s.Namespace)
-				if err != nil {
-					return nil, err
-				}
-				s.EnumTypes[e.Name] = e
-			case "Association": // v3
-				a, err := parseAssociation(dec, tt, s.Namespace)
-				if err != nil {
-					return nil, err
-				}
-				s.Associations[a.Name] = a
-			default:
-				if err := skip(dec, tt.Name.Local); err != nil {
-					return nil, err
-				}
-			}
-		case xml.EndElement:
-			if tt.Name.Local == start.Name.Local {
-				return s, nil
-			}
-		}
-	}
+// Type mappings from EDM primitive types to Zod (keys without "Edm." prefix).
+var edmToZod = map[string]string{
+	"String":         "z.string()",
+	"Int16":          "z.number().int()",
+	"Int32":          "z.number().int()",
+	"Int64":          "z.number().int()",
+	"Byte":           "z.number().int().nonnegative().max(255)",
+	"SByte":          "z.number().int().min(-128).max(127)",
+	"Boolean":        "z.boolean()",
+	"Decimal":        "z.number()", // Or "z.string()" for precision
+	"Double":         "z.number()",
+	"Single":         "z.number()",
+	"Guid":           "z.string().uuid()",
+	"Date":           "z.coerce.date()", // Use coerce directly so it accepts both Date and ISO string inputs
+	"DateTimeOffset": "z.coerce.date()",
+	"TimeOfDay":      "z.string()", // TimeOfDay is typically "HH:MM:SS" and not reliably parseable by Date(), so keep it as string. (Change if your API returns full ISO timestamps.)
+	"Binary":         "z.instanceof(Uint8Array)",
+	"Stream":         "z.instanceof(Uint8Array)",
+	"Duration":       "z.string()",
 }
 
-func parseEntityType(
-	dec *xml.Decoder,
-	start xml.StartElement,
-	ns string,
-) (*EntityType, error) {
-	e := &EntityType{
-		Namespace:  ns,
-		Name:       attr(start, "Name"),
-		BaseType:   attr(start, "BaseType"),
-		Properties: []*Property{},
-		NavPropsV4: []*NavPropertyV4{},
-		NavPropsV3: []*NavPropertyV3{},
-	}
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		switch tt := tok.(type) {
-		case xml.StartElement:
-			switch tt.Name.Local {
-			case "Key":
-				ks, err := parseKey(dec, tt)
-				if err != nil {
-					return nil, err
-				}
-				e.Keys = ks
-			case "Property":
-				p := parseProperty(tt)
-				e.Properties = append(e.Properties, &p)
-				if err := skip(dec, "Property"); err != nil {
-					return nil, err
-				}
-			case "NavigationProperty":
-				// v4 has Type attribute; v3 has Relationship attribute
-				if hasAttr(tt, "Type") {
-					np := parseNavPropV4(tt)
-					e.NavPropsV4 = append(e.NavPropsV4, &np)
-					if err := skip(dec, "NavigationProperty"); err != nil {
-						return nil, err
-					}
-				} else {
-					np := parseNavPropV3(tt)
-					e.NavPropsV3 = append(e.NavPropsV3, &np)
-					if err := skip(dec, "NavigationProperty"); err != nil {
-						return nil, err
-					}
-				}
-			default:
-				if err := skip(dec, tt.Name.Local); err != nil {
-					return nil, err
-				}
-			}
-		case xml.EndElement:
-			if tt.Name.Local == start.Name.Local {
-				return e, nil
-			}
-		}
-	}
+// Type mappings from EDM primitive types to TypeScript types.
+// Align these with the final output type of your Zod pipelines.
+var edmToTs = map[string]string{
+	"String":         "string",
+	"Int16":          "number",
+	"Int32":          "number",
+	"Int64":          "number",
+	"Byte":           "number",
+	"SByte":          "number",
+	"Boolean":        "boolean",
+	"Decimal":        "number", // or "string" if you prefer high precision
+	"Double":         "number",
+	"Single":         "number",
+	"Guid":           "string",
+	"Date":           "Date", // because of z.coerce.date()
+	"DateTimeOffset": "Date",
+	"TimeOfDay":      "Date", // mapped via coerce
+	"Binary":         "Uint8Array",
+	"Stream":         "Uint8Array",
+	"Duration":       "string",
 }
 
-func parseComplexType(
-	dec *xml.Decoder,
-	start xml.StartElement,
-	ns string,
-) (*ComplexType, error) {
-	c := &ComplexType{
-		Namespace:  ns,
-		Name:       attr(start, "Name"),
-		BaseType:   attr(start, "BaseType"),
-		Properties: []*Property{},
+// Helper to extract the type name without namespace.
+func extractEdmTypeName(edmType string) string {
+	fullType := strings.TrimPrefix(edmType, "Collection(")
+	fullType = strings.TrimSuffix(fullType, ")")
+	split := strings.SplitN(fullType, ".", 2)
+	if len(split) == 2 {
+		return split[1] // Local name
 	}
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		switch tt := tok.(type) {
-		case xml.StartElement:
-			switch tt.Name.Local {
-			case "Property":
-				p := parseProperty(tt)
-				c.Properties = append(c.Properties, &p)
-				if err := skip(dec, "Property"); err != nil {
-					return nil, err
-				}
-			default:
-				if err := skip(dec, tt.Name.Local); err != nil {
-					return nil, err
-				}
-			}
-		case xml.EndElement:
-			if tt.Name.Local == start.Name.Local {
-				return c, nil
-			}
-		}
-	}
+	return fullType
 }
 
-func parseEnumType(
-	dec *xml.Decoder,
-	start xml.StartElement,
-	ns string,
-) (*EnumType, error) {
-	e := &EnumType{
-		Namespace:  ns,
-		Name:       attr(start, "Name"),
-		Underlying: attr(start, "UnderlyingType"), // v4
-		IsFlags:    strings.EqualFold(attr(start, "IsFlags"), "true"),
+// Helper to determine if a type is collection and get inner type.
+func isCollection(t string) (bool, string) {
+	if strings.HasPrefix(t, "Collection(") && strings.HasSuffix(t, ")") {
+		return true, t[11 : len(t)-1]
 	}
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		switch tt := tok.(type) {
-		case xml.StartElement:
-			if tt.Name.Local == "Member" {
-				m := EnumMember{
-					Name:  attr(tt, "Name"),
-					Value: attr(tt, "Value"),
-				}
-				e.Members = append(e.Members, m)
-				if err := skip(dec, "Member"); err != nil {
-					return nil, err
-				}
-			} else {
-				if err := skip(dec, tt.Name.Local); err != nil {
-					return nil, err
-				}
-			}
-		case xml.EndElement:
-			if tt.Name.Local == start.Name.Local {
-				return e, nil
-			}
-		}
-	}
+	return false, t
 }
 
-func parseAssociation(
-	dec *xml.Decoder,
-	start xml.StartElement,
-	ns string,
-) (*Association, error) {
-	a := &Association{
-		Namespace: ns,
-		Name:      attr(start, "Name"),
-	}
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		switch tt := tok.(type) {
-		case xml.StartElement:
-			if tt.Name.Local == "End" {
-				end := AssocEnd{
-					Role:         attr(tt, "Role"),
-					Type:         attr(tt, "Type"),
-					Multiplicity: attr(tt, "Multiplicity"),
-				}
-				a.Ends = append(a.Ends, end)
-				if err := skip(dec, "End"); err != nil {
-					return nil, err
-				}
-			} else {
-				if err := skip(dec, tt.Name.Local); err != nil {
-					return nil, err
-				}
-			}
-		case xml.EndElement:
-			if tt.Name.Local == start.Name.Local {
-				return a, nil
-			}
-		}
-	}
-}
+// Get TypeScript type string for a given EDM type.
+func getTsType(edmType string) string {
+	isColl, innerEdm := isCollection(edmType)
+	innerName := extractEdmTypeName(innerEdm)
 
-func parseKey(dec *xml.Decoder, start xml.StartElement) ([]string, error) {
-	var keys []string
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		switch tt := tok.(type) {
-		case xml.StartElement:
-			if tt.Name.Local == "PropertyRef" {
-				n := attr(tt, "Name")
-				if n != "" {
-					keys = append(keys, n)
-				}
-				if err := skip(dec, "PropertyRef"); err != nil {
-					return nil, err
-				}
-			} else {
-				if err := skip(dec, tt.Name.Local); err != nil {
-					return nil, err
-				}
-			}
-		case xml.EndElement:
-			if tt.Name.Local == start.Name.Local {
-				return keys, nil
-			}
-		}
-	}
-}
-
-func parseProperty(start xml.StartElement) Property {
-	p := Property{
-		Name:     attr(start, "Name"),
-		Type:     attr(start, "Type"),
-		Nullable: parseNullablePtr(attr(start, "Nullable")),
-	}
-	return p
-}
-
-func parseNavPropV4(start xml.StartElement) NavPropertyV4 {
-	return NavPropertyV4{
-		Name:     attr(start, "Name"),
-		Type:     attr(start, "Type"),
-		Nullable: parseNullablePtr(attr(start, "Nullable")),
-	}
-}
-
-func parseNavPropV3(start xml.StartElement) NavPropertyV3 {
-	return NavPropertyV3{
-		Name:         attr(start, "Name"),
-		Relationship: attr(start, "Relationship"),
-		FromRole:     attr(start, "FromRole"),
-		ToRole:       attr(start, "ToRole"),
-	}
-}
-
-func attr(se xml.StartElement, name string) string {
-	for _, a := range se.Attr {
-		if a.Name.Local == name {
-			return a.Value
-		}
-	}
-	return ""
-}
-func hasAttr(se xml.StartElement, name string) bool {
-	for _, a := range se.Attr {
-		if a.Name.Local == name {
-			return true
-		}
-	}
-	return false
-}
-func skip(dec *xml.Decoder, local string) error {
-	depth := 1
-	for depth > 0 {
-		tok, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		switch tt := tok.(type) {
-		case xml.StartElement:
-			depth++
-		case xml.EndElement:
-			if tt.Name.Local == local {
-				depth--
-			} else {
-				depth--
-			}
-		}
-	}
-	return nil
-}
-func parseNullablePtr(v string) *bool {
-	if v == "" {
-		return nil
-	}
-	b := strings.EqualFold(v, "true")
-	if strings.EqualFold(v, "false") {
-		b = false
-	}
-	return &b
-}
-
-/* ===========================
-   Code generation
-   =========================== */
-
-type genState struct {
-	opts          Options
-	schemas       []*Schema
-	nsAliases     map[string]string
-	useTime       bool
-	useDecimal    bool
-	decimalImport string                  // "github.com/shopspring/decimal"
-	knownTypes    map[string]bool         // qualified "NS.Name"
-	typeNameMap   map[string]string       // qualified -> GoTypeName
-	assocByQName  map[string]*Association // "NS.Assoc"
-	useJSON       bool
-	useFmt        bool
-	useStrings    bool
-}
-
-func generate(schemas []*Schema, opts Options) (string, error) {
-	st := &genState{
-		opts:          opts,
-		schemas:       schemas,
-		nsAliases:     map[string]string{},
-		knownTypes:    map[string]bool{},
-		typeNameMap:   map[string]string{},
-		assocByQName:  map[string]*Association{},
-		decimalImport: "github.com/shopspring/decimal",
-	}
-
-	// Build list of namespaces and decide aliasing
-	nsList := distinctNamespaces(schemas)
-	needPrefix := opts.NsPrefixMode == "always" ||
-		(opts.NsPrefixMode == "auto" && len(nsList) > 1)
-	for _, ns := range nsList {
-		alias := namespaceAlias(ns)
-		st.nsAliases[ns] = alias
-	}
-
-	// Register known types and associations
-	for _, s := range schemas {
-		for name := range s.EntityTypes {
-			qn := s.Namespace + "." + name
-			st.knownTypes[qn] = true
-		}
-		for name := range s.ComplexTypes {
-			qn := s.Namespace + "." + name
-			st.knownTypes[qn] = true
-		}
-		for name := range s.EnumTypes {
-			qn := s.Namespace + "." + name
-			st.knownTypes[qn] = true
-		}
-		for name, a := range s.Associations {
-			st.assocByQName[s.Namespace+"."+name] = a
-		}
-	}
-
-	// Compute Go type names for qualified types
-	// If needPrefix, always prepend ns alias; else only if conflicts
-	conflictNames := map[string]int{}
-	for qn := range st.knownTypes {
-		base := baseNameFromQualified(qn)
-		conflictNames[base]++
-	}
-	for qn := range st.knownTypes {
-		ns, base := splitQualified(qn)
-		goName := goExported(base)
-		if needPrefix || conflictNames[base] > 1 {
-			goName = st.nsAliases[ns] + goName
-		}
-		st.typeNameMap[qn] = goName
-	}
-
-	// Start generating
-	var b strings.Builder
-	b.WriteString("// Code generated by odata2go. DO NOT EDIT.\n")
-	b.WriteString("// Source: OData metadata (Edmx)\n\n")
-	b.WriteString("package " + opts.PkgName + "\n\n")
-
-	// Imports determined later; collect types first
-	var typeBlocks []string
-
-	// Enums
-	enumKeys := []string{}
-	for _, s := range schemas {
-		for name := range s.EnumTypes {
-			enumKeys = append(enumKeys, s.Namespace+"."+name)
-		}
-	}
-	sort.Strings(enumKeys)
-	for _, qn := range enumKeys {
-		ns, name := splitQualified(qn)
-		e := findEnum(schemas, ns, name)
-		if e == nil {
-			continue
-		}
-		typeDecl := st.emitEnum(e)
-		typeBlocks = append(typeBlocks, typeDecl)
-	}
-
-	// Complex types first (often used in entities)
-	compKeys := []string{}
-	for _, s := range schemas {
-		for name := range s.ComplexTypes {
-			compKeys = append(compKeys, s.Namespace+"."+name)
-		}
-	}
-	sort.Strings(compKeys)
-	for _, qn := range compKeys {
-		ns, name := splitQualified(qn)
-		c := findComplex(schemas, ns, name)
-		if c == nil {
-			continue
-		}
-		typeDecl := st.emitComplex(c)
-		typeBlocks = append(typeBlocks, typeDecl)
-	}
-
-	// Entity types
-	entKeys := []string{}
-	for _, s := range schemas {
-		for name := range s.EntityTypes {
-			entKeys = append(entKeys, s.Namespace+"."+name)
-		}
-	}
-	sort.Strings(entKeys)
-	for _, qn := range entKeys {
-		ns, name := splitQualified(qn)
-		e := findEntity(schemas, ns, name)
-		if e == nil {
-			continue
-		}
-		typeDecl := st.emitEntity(e)
-		typeBlocks = append(typeBlocks, typeDecl)
-	}
-
-	// Imports
-	imports := st.collectImports()
-	if len(imports) > 0 {
-		b.WriteString("import (\n")
-		for _, imp := range imports {
-			b.WriteString("  \"" + imp + "\"\n")
-		}
-		b.WriteString(")\n\n")
-	}
-
-	// Write types
-	for _, block := range typeBlocks {
-		b.WriteString(block)
-		if !strings.HasSuffix(block, "\n") {
-			b.WriteString("\n")
-		}
-	}
-
-	return b.String(), nil
-}
-
-func (st *genState) collectImports() []string {
-	set := map[string]bool{}
-	if st.useTime {
-		set["time"] = true
-	}
-	if st.useDecimal && st.opts.DecimalMode == "shopspring" {
-		set[st.decimalImport] = true
-	}
-	if st.useJSON {
-		set["encoding/json"] = true
-	}
-	if st.useFmt {
-		set["fmt"] = true
-	}
-	if st.useStrings {
-		set["strings"] = true
-	}
-	keys := []string{}
-	for k := range set {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func (st *genState) emitEnum(e *EnumType) string {
-	qn := e.Namespace + "." + e.Name
-	goName := st.typeNameMap[qn]
-	underlying := e.Underlying
-	if underlying == "" {
-		underlying = "Edm.Int32"
-	}
-	goUnder, _, _ := st.mapEdmToGo(underlying, false)
-	if goUnder == "" {
-		goUnder = "int32"
-	}
-	// We will emit JSON marshal/unmarshal methods
-	st.useJSON = true
-	st.useFmt = true
-	if e.IsFlags {
-		st.useStrings = true
-	}
-	var b strings.Builder
-	b.WriteString("// " + goName + " is an enum from OData.\n")
-	b.WriteString("type " + goName + " " + goUnder + "\n\n")
-	if len(e.Members) > 0 {
-		b.WriteString("const (\n")
-		for idx, m := range e.Members {
-			constName := goName + goExported(m.Name)
-			if m.Value != "" {
-				b.WriteString("  " + constName + " " + goName + " = " +
-					castEnumValue(goUnder, m.Value) + "\n")
-			} else {
-				// Sequential if no values; use iota
-				if idx == 0 {
-					b.WriteString("  " + constName + " " + goName + " = iota\n")
-				} else {
-					b.WriteString("  " + constName + "\n")
-				}
-			}
-		}
-		b.WriteString(")\n\n")
-	}
-	// name <-> value maps
-	b.WriteString("var _" + goName + "_nameToValue = map[string]" + goName + "{\n")
-	for _, m := range e.Members {
-		constName := goName + goExported(m.Name)
-		b.WriteString("  " + strconvQuote(m.Name) + ": " + constName + ",\n")
-	}
-	b.WriteString("}\n\n")
-
-	b.WriteString("var _" + goName + "_valueToName = map[" + goName + "]string{\n")
-	for _, m := range e.Members {
-		constName := goName + goExported(m.Name)
-		b.WriteString("  " + constName + ": " + strconvQuote(m.Name) + ",\n")
-	}
-	b.WriteString("}\n\n")
-
-	// UnmarshalJSON supports both string names and numeric values.
-	b.WriteString("func (t *" + goName + ") UnmarshalJSON(b []byte) error {\n")
-	b.WriteString("  if string(b) == \"null\" {\n")
-	b.WriteString("    *t = 0\n")
-	b.WriteString("    return nil\n")
-	b.WriteString("  }\n")
-	b.WriteString("  if len(b) > 0 && b[0] == '\"' {\n")
-	b.WriteString("    var s string\n")
-	b.WriteString("    if err := json.Unmarshal(b, &s); err != nil { return err }\n")
-	if e.IsFlags {
-		b.WriteString("    if s == \"\" { *t = 0; return nil }\n")
-		b.WriteString("    var v " + goName + "\n")
-		b.WriteString("    for _, p := range strings.Split(s, \",\") {\n")
-		b.WriteString("      p = strings.TrimSpace(p)\n")
-		b.WriteString("      if p == \"\" { continue }\n")
-		b.WriteString("      mv, ok := _" + goName + "_nameToValue[p]\n")
-		b.WriteString("      if !ok { return fmt.Errorf(\"invalid " + goName + " value %q\", p) }\n")
-		b.WriteString("      v |= mv\n")
-		b.WriteString("    }\n")
-		b.WriteString("    *t = v\n")
-		b.WriteString("    return nil\n")
+	var baseTs string
+	if ts, ok := edmToTs[innerName]; ok {
+		baseTs = ts
+	} else if innerName != "" {
+		// Non-primitive: reference the generated friendly type (enum or complex/entity)
+		baseTs = strings.Title(innerName)
 	} else {
-		b.WriteString("    if v, ok := _" + goName + "_nameToValue[s]; ok {\n")
-		b.WriteString("      *t = v\n")
-		b.WriteString("      return nil\n")
-		b.WriteString("    }\n")
-		b.WriteString("    return fmt.Errorf(\"invalid " + goName + " value %q\", s)\n")
+		baseTs = "unknown"
+		log.Printf("Warning: Unknown TS type for '%s', using unknown", edmType)
 	}
-	b.WriteString("  }\n")
-	b.WriteString("  var n " + goUnder + "\n")
-	b.WriteString("  if err := json.Unmarshal(b, &n); err != nil { return err }\n")
-	b.WriteString("  *t = " + goName + "(n)\n")
-	b.WriteString("  return nil\n")
-	b.WriteString("}\n\n")
 
-	// MarshalJSON emits the string name when known; numeric otherwise.
-	b.WriteString("func (t " + goName + ") MarshalJSON() ([]byte, error) {\n")
-	b.WriteString("  if s, ok := _" + goName + "_valueToName[t]; ok {\n")
-	b.WriteString("    return json.Marshal(s)\n")
-	b.WriteString("  }\n")
-	b.WriteString("  n := " + goUnder + "(t)\n")
-	b.WriteString("  return json.Marshal(n)\n")
-	b.WriteString("}\n\n")
-
-	// String returns the enum name if known; otherwise the numeric value.
-	b.WriteString("func (t " + goName + ") String() string {\n")
-	b.WriteString("  if s, ok := _" + goName + "_valueToName[t]; ok { return s }\n")
-	b.WriteString("  return fmt.Sprintf(\"%d\", " + goUnder + "(t))\n")
-	b.WriteString("}\n\n")
-	return b.String()
+	if isColl {
+		return baseTs + "[]"
+	}
+	return baseTs
 }
 
-func castEnumValue(goUnder string, value string) string {
-	// Emit as literal, default to int parse
-	if strings.HasPrefix(goUnder, "int") ||
-		strings.HasPrefix(goUnder, "uint") ||
-		strings.HasPrefix(goUnder, "byte") {
-		return value
+// Get Zod type string for a given EDM type, wrapping refs in z.lazy for cycles/forward refs.
+func getZodType(edmType string, isNullable bool, targetSchemaName string) string {
+	isColl, innerEdm := isCollection(edmType)
+	innerName := extractEdmTypeName(innerEdm)
+
+	var baseZod string
+	if zod, ok := edmToZod[innerName]; ok {
+		baseZod = zod
+	} else if innerName != "" {
+		// Non-primitive: reference the schema (enum or complex/entity).
+		if targetSchemaName == "" {
+			targetSchemaName = innerName + "Schema"
+		}
+		baseZod = fmt.Sprintf("z.lazy(() => %s)", targetSchemaName)
+	} else {
+		baseZod = "z.unknown()"
+		log.Printf("Warning: Unknown type '%s' for field, using z.unknown()", edmType)
 	}
-	// Fallback: wrap in type conversion (string enums are rare)
-	return value
+
+	if isColl {
+		baseZod = fmt.Sprintf("z.array(%s)", baseZod)
+		baseZod += ".nullish()"
+		return baseZod
+	}
+
+	baseZod += ".nullish()"
+	return baseZod
 }
 
-func (st *genState) emitComplex(c *ComplexType) string {
-	qn := c.Namespace + "." + c.Name
-	goName := st.typeNameMap[qn]
+// Generate a TypeScript model type alias (used to break TS inference cycles).
+// We generate NameModel instead of Name to preserve your existing export `type Name = z.infer<...>`
+func generateTsModelType(typ interface{}) string {
+	var name string
+	var props []Property
+	var navs []NavigationProperty
+
+	switch t := typ.(type) {
+	case EntityType:
+		name = t.Name
+		props = t.Properties
+		navs = t.NavigationProperties
+	case ComplexType:
+		name = t.Name
+		props = t.Properties
+		navs = t.NavigationProperties
+	}
+
+	tsTypeName := strings.Title(name) + "Model"
 	var b strings.Builder
-	b.WriteString("// " + goName + " is a complex type.\n")
-	b.WriteString("type " + goName + " struct {\n")
-	// Embed base type if present
-	if c.BaseType != "" && st.knownTypes[c.BaseType] {
-		bName := st.typeNameMap[c.BaseType]
-		b.WriteString("  " + bName + "\n")
-	}
-	// Properties
-	for _, p := range c.Properties {
-		field := st.fieldForProperty(p, c.Namespace)
-		b.WriteString("  " + field + "\n")
-	}
-	b.WriteString("}\n\n")
-	return b.String()
-}
+	b.WriteString(fmt.Sprintf("export type %s = {\n", tsTypeName))
 
-func (st *genState) emitEntity(e *EntityType) string {
-	qn := e.Namespace + "." + e.Name
-	goName := st.typeNameMap[qn]
-	var b strings.Builder
-	b.WriteString("// " + goName + " is an entity type.\n")
-	b.WriteString("type " + goName + " struct {\n")
-	// Embed base type if present
-	if e.BaseType != "" && st.knownTypes[e.BaseType] {
-		bName := st.typeNameMap[e.BaseType]
-		b.WriteString("  " + bName + "\n")
+	// Scalar properties
+	for _, p := range props {
+		tsType := getTsType(p.Type)
+		// Allow nulls commonly returned by the service: T | null, and property optional
+		b.WriteString(fmt.Sprintf("  %s?: %s | null;\n", p.Name, tsType))
 	}
-	// Properties
-	keySet := map[string]bool{}
-	for _, k := range e.Keys {
-		keySet[k] = true
-	}
-	for _, p := range e.Properties {
-		field := st.fieldForPropertyWithKey(p, e.Namespace, keySet)
-		b.WriteString("  " + field + "\n")
-	}
+
 	// Navigation properties
-	for _, np := range e.NavPropsV4 {
-		field := st.fieldForNavV4(np, e.Namespace)
-		b.WriteString("  " + field + "\n")
+	for _, n := range navs {
+		target := extractEdmTypeName(n.Type)
+		targetTs := strings.Title(target)
+		if isColl, _ := isCollection(n.Type); isColl {
+			b.WriteString(fmt.Sprintf("  %s?: %s[] | null;\n", n.Name, targetTs))
+		} else {
+			b.WriteString(fmt.Sprintf("  %s?: %s | null;\n", n.Name, targetTs))
+		}
 	}
-	for _, np := range e.NavPropsV3 {
-		field := st.fieldForNavV3(np, e.Namespace)
-		b.WriteString("  " + field + "\n")
-	}
-	b.WriteString("}\n\n")
+
+	b.WriteString("};\n\n")
 	return b.String()
 }
 
-/* ===========================
-   Field generation helpers
-   =========================== */
+// Generate Zod schema for EntityType or ComplexType (as TS code string).
+func generateZodSchema(typ interface{}, isEntity bool, schemaNs string) string {
+	var name string
+	var props []Property
+	var navs []NavigationProperty
 
-func (st *genState) fieldForProperty(p *Property, ctxNS string) string {
-	return st.fieldForPropertyWithKey(p, ctxNS, nil)
-}
-
-func (st *genState) fieldForPropertyWithKey(
-	p *Property,
-	ctxNS string,
-	keySet map[string]bool,
-) string {
-	fieldName := safeFieldName(p.Name)
-	// Resolve type
-	goType := st.resolveTypeRef(p.Type, p.Nullable, ctxNS)
-	tags := []string{`json:"` + p.Name + `,omitempty"`}
-	if keySet != nil && keySet[p.Name] {
-		tags = append(tags, `key:"true"`)
+	switch t := typ.(type) {
+	case EntityType:
+		name = t.Name
+		props = t.Properties
+		navs = t.NavigationProperties
+	case ComplexType:
+		name = t.Name
+		props = t.Properties
+		navs = t.NavigationProperties
 	}
-	return fmt.Sprintf("%s %s `%s`",
-		fieldName, goType, strings.Join(tags, " "))
-}
 
-func (st *genState) fieldForNavV4(
-	np *NavPropertyV4,
-	ctxNS string,
-) string {
-	fieldName := safeFieldName(np.Name)
-	goType := st.resolveTypeRef(np.Type, np.Nullable, ctxNS)
-	tag := `json:"` + np.Name + `,omitempty"`
-	return fmt.Sprintf("%s %s `%s`", fieldName, goType, tag)
-}
+	schemaName := strings.Title(name) + "Schema"
+	tsModelName := strings.Title(name) + "Model"
+	tsTypeName := strings.Title(name)
 
-func (st *genState) fieldForNavV3(
-	np *NavPropertyV3,
-	ctxNS string,
-) string {
-	fieldName := safeFieldName(np.Name)
-	// Resolve via Association
-	// Relationship is NS.Association
-	assoc := st.assocByQName[np.Relationship]
-	elemType := "interface{}"
-	isCollection := false
-	if assoc != nil {
-		// Find the ToRole end
-		var target AssocEnd
-		for _, end := range assoc.Ends {
-			if end.Role == np.ToRole {
-				target = end
-				break
-			}
-		}
-		if target.Type != "" {
-			elemType = st.resolveTypeRef(target.Type, nil, ctxNS)
-			// target.Type is qualified NS.Entity, not a Collection
-			// Determine multiplicity for collection
-			if target.Multiplicity == "*" || target.Multiplicity == "0..*" {
-				isCollection = true
-			} else {
-				isCollection = false
-			}
-		}
+	var fields strings.Builder
+	fields.WriteString(fmt.Sprintf("export const %s: ZodType<%s> = z.object({\n", schemaName, tsModelName))
+
+	// Fields from properties (exact original casing from metadata)
+	for _, p := range props {
+		fieldKey := p.Name
+		zodType := getZodType(p.Type, p.Nullable, "")
+		fields.WriteString(fmt.Sprintf("\t%s: %s,\n", fieldKey, zodType))
 	}
-	var goType string
-	if isCollection {
-		// Slice of element type (strip pointer for collection)
-		elem := stripPointer(elemType)
-		goType = "[]" + elem
-	} else {
-		// Single; pointer to struct types
-		if !strings.HasPrefix(elemType, "*") &&
-			isStructNamedType(elemType) {
-			goType = "*" + elemType
+
+	// Navigation properties (exact original casing from metadata)
+	for _, n := range navs {
+		fieldKey := n.Name
+		targetName := extractEdmTypeName(n.Type)
+		targetSchema := strings.Title(targetName) + "Schema"
+		isColl, _ := isCollection(n.Type)
+		var zodType string
+		if isColl {
+			zodType = fmt.Sprintf("z.array(z.lazy(() => %s))", targetSchema)
+			zodType += ".nullish()"
 		} else {
-			goType = elemType
+			zodType = fmt.Sprintf("z.lazy(() => %s)", targetSchema)
+			zodType += ".nullish()"
 		}
+		fields.WriteString(fmt.Sprintf("\t%s: %s,\n", fieldKey, zodType))
 	}
-	tag := `json:"` + np.Name + `,omitempty"`
-	return fmt.Sprintf("%s %s `%s`", fieldName, goType, tag)
+
+	fields.WriteString("});\n")
+	fields.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n\n", tsTypeName, schemaName))
+	return fields.String()
 }
 
-func stripPointer(t string) string {
-	if strings.HasPrefix(t, "*") {
-		return strings.TrimPrefix(t, "*")
+// Helper to convert enum member name to SAP B1 JSON string casing (lowercase first letter).
+func toSapJsonEnumValue(memberName string) string {
+	if len(memberName) == 0 {
+		return memberName
 	}
-	return t
+	return strings.ToLower(memberName[0:1]) + memberName[1:]
 }
 
-func isStructNamedType(t string) bool {
-	// crude heuristic: named type without [] or map or basic
-	if strings.HasPrefix(t, "[]") || strings.HasPrefix(t, "map[") {
-		return false
-	}
-	basic := map[string]bool{
-		"string": true, "bool": true, "byte": true, "rune": true,
-		"int": true, "int8": true, "int16": true, "int32": true,
-		"int64": true, "uint": true, "uint8": true, "uint16": true,
-		"uint32": true, "uint64": true, "float32": true, "float64": true,
-		"time.Time": true, "json.RawMessage": true,
-	}
-	if basic[t] {
-		return false
-	}
-	// decimal.Decimal is struct named type
-	if t == "decimal.Decimal" {
-		return true
-	}
-	// Assume other non-basic names are struct types
-	return true
-}
+// Generate TS enum + Zod schema for EnumType, handling SAP B1 string casing in JSON.
+func generateZodEnum(e EnumType) string {
+	var members strings.Builder
+	members.WriteString(fmt.Sprintf("export const %s = {\n", e.Name))
 
-var reCollection = regexp.MustCompile(`^Collection\((.+)\)$`)
-
-func (st *genState) resolveTypeRef(
-	raw string,
-	nullable *bool,
-	ctxNS string,
-) string {
-	// Collection(...)
-	if m := reCollection.FindStringSubmatch(raw); len(m) == 2 {
-		inner := st.resolveTypeRef(m[1], nil, ctxNS)
-		// For collections of complex/entity, use slice of concrete (no pointer)
-		return "[]" + stripPointer(inner)
-	}
-
-	// Edm.* primitives
-	if strings.HasPrefix(raw, "Edm.") {
-		t, needsTime, needsDec := st.mapEdmToGo(raw, boolOrDefault(nullable, true))
-		if needsTime {
-			st.useTime = true
-		}
-		if needsDec {
-			st.useDecimal = true
-		}
-		return t
-	}
-
-	// Qualified "NS.Type" or maybe unqualified type: assume ctxNS
-	qn := raw
-	if !strings.Contains(raw, ".") {
-		qn = ctxNS + "." + raw
-	}
-	goName := st.typeNameMap[qn]
-	if goName == "" {
-		// Unknown type; fallback
-		return "interface{}"
-	}
-
-	// Nullability: for non-collection and non-basic, pointer for nullable
-	isNullable := boolOrDefault(nullable, true)
-	if isNullable {
-		// For named struct types, prefer pointer
-		if isStructNamedType(goName) {
-			return "*" + goName
-		}
-	}
-	return goName
-}
-
-func (st *genState) mapEdmToGo(
-	edm string,
-	nullable bool,
-) (goType string, needsTime bool, needsDecimal bool) {
-	switch edm {
-	case "Edm.String":
-		if nullable {
-			return "*string", false, false
-		}
-		return "string", false, false
-	case "Edm.Boolean":
-		if nullable {
-			return "*bool", false, false
-		}
-		return "bool", false, false
-	case "Edm.Byte":
-		if nullable {
-			return "*uint8", false, false
-		}
-		return "uint8", false, false
-	case "Edm.SByte":
-		if nullable {
-			return "*int8", false, false
-		}
-		return "int8", false, false
-	case "Edm.Int16":
-		if nullable {
-			return "*int16", false, false
-		}
-		return "int16", false, false
-	case "Edm.Int32":
-		if nullable {
-			return "*int32", false, false
-		}
-		return "int32", false, false
-	case "Edm.Int64":
-		if nullable {
-			return "*int64", false, false
-		}
-		return "int64", false, false
-	case "Edm.Single":
-		if nullable {
-			return "*float32", false, false
-		}
-		return "float32", false, false
-	case "Edm.Double":
-		if nullable {
-			return "*float64", false, false
-		}
-		return "float64", false, false
-	case "Edm.Decimal":
-		if st.opts.DecimalMode == "string" {
-			if nullable {
-				return "*string", false, false
+	currentValue := 0
+	for _, m := range e.Members {
+		var valStr string
+		jsonValue := toSapJsonEnumValue(m.Name)
+		if m.Value != "" {
+			val, err := strconv.Atoi(m.Value)
+			if err != nil {
+				valStr = fmt.Sprintf("%d /* parsed error: %s */", currentValue, m.Value)
+			} else {
+				valStr = fmt.Sprintf("%d", val)
+				currentValue = val + 1
 			}
-			return "string", false, false
+		} else {
+			valStr = fmt.Sprintf("%d", currentValue)
+			currentValue++
 		}
-		// shopspring/decimal
-		if nullable {
-			return "*decimal.Decimal", false, true
-		}
-		return "decimal.Decimal", false, true
-	case "Edm.Date", "Edm.DateTime", "Edm.DateTimeOffset":
-		// Use time.Time for all date/time
-		return "time.Time", true, false
-	case "Edm.TimeOfDay", "Edm.Time": // v4 time-only or v3 duration-like
-		// Represent as string "HH:MM:SS[.fffffff]"
-		if nullable {
-			return "*string", false, false
-		}
-		return "string", false, false
-	case "Edm.Duration":
-		// ISO 8601 duration e.g., "P3D"; keep as string
-		if nullable {
-			return "*string", false, false
-		}
-		return "string", false, false
-	case "Edm.Binary":
-		// JSON payload is base64; []byte works with encoding/json
-		return "[]byte", false, false
-	case "Edm.Guid":
-		if nullable {
-			return "*string", false, false
-		}
-		return "string", false, false
-	default:
-		// Geospatial and others: fallback to string
-		if nullable {
-			return "*string", false, false
-		}
-		return "string", false, false
+		memberName := strings.Title(m.Name) // PascalCase for TS key
+		members.WriteString(fmt.Sprintf("\t%s: '%s', // numeric value: %s\n", memberName, jsonValue, valStr))
 	}
+	members.WriteString("} as const;\n\n")
+
+	// Type from const
+	members.WriteString(fmt.Sprintf("export type %s = typeof %s[keyof typeof %s];\n\n", e.Name, e.Name, e.Name))
+
+	// Zod schema using z.enum with the JSON string values
+	schemaName := e.Name + "Schema"
+	members.WriteString(fmt.Sprintf("export const %s = z.enum(Object.values(%s));\n", schemaName, e.Name))
+	members.WriteString(fmt.Sprintf("export type %sType = z.infer<typeof %s>;\n\n", e.Name, schemaName))
+	return members.String()
 }
 
-/* ===========================
-   Lookups and utilities
-   =========================== */
-
-func findEntity(schemas []*Schema, ns, name string) *EntityType {
-	for _, s := range schemas {
-		if s.Namespace == ns {
-			if e := s.EntityTypes[name]; e != nil {
-				return e
-			}
-		}
+// Debug function to dump parsed structure as XML.
+func dumpParsedXML(edmx *EDMX, filename string) {
+	data, err := xml.MarshalIndent(edmx, "", "  ")
+	if err != nil {
+		log.Printf("Error dumping parsed structure: %v", err)
+		return
 	}
-	return nil
-}
-func findComplex(schemas []*Schema, ns, name string) *ComplexType {
-	for _, s := range schemas {
-		if s.Namespace == ns {
-			if c := s.ComplexTypes[name]; c != nil {
-				return c
-			}
-		}
-	}
-	return nil
-}
-func findEnum(schemas []*Schema, ns, name string) *EnumType {
-	for _, s := range schemas {
-		if s.Namespace == ns {
-			if e := s.EnumTypes[name]; e != nil {
-				return e
-			}
-		}
-	}
-	return nil
+	_ = ioutil.WriteFile(filename, data, 0644)
+	log.Printf("Dumped parsed structure to %s for debugging", filename)
 }
 
-func distinctNamespaces(schemas []*Schema) []string {
-	set := map[string]bool{}
-	for _, s := range schemas {
-		if s.Namespace != "" {
-			set[s.Namespace] = true
-		}
+// ---------- Splitting helpers ----------
+
+func ensureDir(dir string) error {
+	return os.MkdirAll(dir, 0755)
+}
+
+func writeFile(path string, content string) error {
+	if err := ensureDir(filepath.Dir(path)); err != nil {
+		return err
 	}
-	out := []string{}
-	for ns := range set {
-		out = append(out, ns)
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+func toSortedSlice(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
 	}
 	sort.Strings(out)
 	return out
 }
 
-func namespaceAlias(ns string) string {
-	// Use last segment after '.' or '/'
-	seg := ns
-	if idx := strings.LastIndex(ns, "."); idx >= 0 {
-		seg = ns[idx+1:]
+func makeSet(values []string) map[string]struct{} {
+	s := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		s[v] = struct{}{}
 	}
-	if idx := strings.LastIndex(seg, "/"); idx >= 0 {
-		seg = seg[idx+1:]
-	}
-	seg = sanitizeIdent(seg)
-	if seg == "" {
-		seg = "NS"
-	}
-	// Ensure exported and CamelCase
-	return goExported(seg)
+	return s
 }
 
-func baseNameFromQualified(qn string) string {
-	_, base := splitQualified(qn)
-	return base
+func collectTypeAndEnumDeps(
+	typ interface{},
+	entitySet map[string]struct{},
+	complexSet map[string]struct{},
+	enumSet map[string]struct{},
+) (typeDeps map[string]struct{}, enumDeps map[string]struct{}) {
+	typeDeps = map[string]struct{}{}
+	enumDeps = map[string]struct{}{}
+
+	var props []Property
+	var navs []NavigationProperty
+	var selfName string
+
+	switch t := typ.(type) {
+	case EntityType:
+		selfName = t.Name
+		props = t.Properties
+		navs = t.NavigationProperties
+	case ComplexType:
+		selfName = t.Name
+		props = t.Properties
+		navs = t.NavigationProperties
+	}
+
+	addType := func(name string) {
+		if name == "" || name == selfName {
+			return
+		}
+		if _, isPrimitive := edmToZod[name]; isPrimitive {
+			return
+		}
+		if _, isEnum := enumSet[name]; isEnum {
+			enumDeps[name] = struct{}{}
+			return
+		}
+		// else it's entity or complex
+		if _, ok := entitySet[name]; ok {
+			typeDeps[name] = struct{}{}
+			return
+		}
+		if _, ok := complexSet[name]; ok {
+			typeDeps[name] = struct{}{}
+			return
+		}
+		// unknown type name, still add as type dep to be safe
+		typeDeps[name] = struct{}{}
+	}
+
+	// scalar properties
+	for _, p := range props {
+		_, inner := isCollection(p.Type)
+		innerName := extractEdmTypeName(inner)
+		addType(innerName)
+	}
+
+	// navigation properties always point to entity or collection of entity
+	for _, n := range navs {
+		_, inner := isCollection(n.Type)
+		innerName := extractEdmTypeName(inner)
+		addType(innerName)
+	}
+
+	return
 }
 
-func splitQualified(qn string) (ns, name string) {
-	idx := strings.LastIndex(qn, ".")
-	if idx < 0 {
-		return "", qn
+func renderPerTypeFile(
+	typ interface{},
+	isEntity bool,
+	entitySet map[string]struct{},
+	complexSet map[string]struct{},
+	enumSet map[string]struct{},
+	generatedAt string,
+) (fileName string, content string) {
+	var name string
+	switch t := typ.(type) {
+	case EntityType:
+		name = t.Name
+	case ComplexType:
+		name = t.Name
 	}
-	return qn[:idx], qn[idx+1:]
-}
+	titleName := strings.Title(name)
+	fileName = titleName + ".ts"
 
-func goExported(name string) string {
-	if name == "" {
-		return "X"
+	// Collect dependencies
+	typeDeps, enumDeps := collectTypeAndEnumDeps(typ, entitySet, complexSet, enumSet)
+	typeDepNames := toSortedSlice(typeDeps)
+	enumDepNames := toSortedSlice(enumDeps)
+
+	// Build imports
+	var b strings.Builder
+
+	b.WriteString("// Generated from OData EDMX for SAP Business One Service Layer v2\n")
+	b.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
+	b.WriteString(fmt.Sprintf("// Generated at %s\n\n", generatedAt))
+	b.WriteString("import { z, ZodType } from 'zod';\n")
+
+	// Enums: import type + schema in one module
+	if len(enumDepNames) > 0 {
+		// type imports
+		b.WriteString(fmt.Sprintf("import type { %s } from '../enums';\n",
+			strings.Join(enumDepNames, ", ")))
+		// value imports (schemas)
+		enumSchemas := make([]string, 0, len(enumDepNames))
+		for _, e := range enumDepNames {
+			enumSchemas = append(enumSchemas, e+"Schema")
+		}
+		b.WriteString(fmt.Sprintf("import { %s } from '../enums';\n", strings.Join(enumSchemas, ", ")))
 	}
-	// Keep underscores as-is for SAP U_ fields
-	runes := []rune(name)
-	runes[0] = unicode.ToUpper(runes[0])
-	// Remove invalid characters
-	out := make([]rune, 0, len(runes))
-	for i, r := range runes {
-		if i == 0 {
-			if unicode.IsLetter(r) || r == '_' {
-				out = append(out, r)
+
+	// Type deps: import type and schema from correct folders
+	for _, dep := range typeDepNames {
+		depPath := ""
+		// decide folder and relative path
+		if _, ok := entitySet[dep]; ok {
+			if isEntity {
+				depPath = "./" + strings.Title(dep)
 			} else {
-				out = append(out, 'X')
-				if unicode.IsDigit(r) {
-					out = append(out, r)
-				}
+				depPath = "../entities/" + strings.Title(dep)
+			}
+		} else if _, ok := complexSet[dep]; ok {
+			if isEntity {
+				depPath = "../complex/" + strings.Title(dep)
+			} else {
+				depPath = "./" + strings.Title(dep)
 			}
 		} else {
-			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
-				out = append(out, r)
+			// fallback assume entity in sibling (better than nothing)
+			if isEntity {
+				depPath = "./" + strings.Title(dep)
+			} else {
+				depPath = "./" + strings.Title(dep)
 			}
 		}
+		// type-only import for friendly type
+		b.WriteString(fmt.Sprintf("import type { %s } from '%s';\n", strings.Title(dep), depPath))
+		// schema import
+		b.WriteString(fmt.Sprintf("import { %sSchema } from '%s';\n", strings.Title(dep), depPath))
 	}
-	return string(out)
+
+	if len(enumDepNames) > 0 || len(typeDepNames) > 0 {
+		b.WriteString("\n")
+	}
+
+	// Model + Schema
+	b.WriteString(generateTsModelType(typ))
+	b.WriteString(generateZodSchema(typ, isEntity, ""))
+
+	content = b.String()
+	return
 }
 
-func sanitizeIdent(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
+func writePerTypeOutputs(
+	edmx *EDMX,
+	outDir string,
+) error {
+	generatedAt := time.Now().Format(time.RFC3339)
+
+	// Index sets for quick lookups
+	enumSet := map[string]struct{}{}
+	entitySet := map[string]struct{}{}
+	complexSet := map[string]struct{}{}
+
+	var allEnums []EnumType
+	var allEntities []EntityType
+	var allComplexes []ComplexType
+
+	for _, schema := range edmx.DataServices.Schemas {
+		allEnums = append(allEnums, schema.EnumTypes...)
+		allEntities = append(allEntities, schema.EntityTypes...)
+		allComplexes = append(allComplexes, schema.ComplexTypes...)
+	}
+
+	for _, e := range allEnums {
+		enumSet[e.Name] = struct{}{}
+	}
+	for _, e := range allEntities {
+		entitySet[e.Name] = struct{}{}
+	}
+	for _, c := range allComplexes {
+		complexSet[c.Name] = struct{}{}
+	}
+
+	// 1) Write enums.ts
+	{
+		var b strings.Builder
+		b.WriteString("// Generated enums from OData EDMX for SAP Business One Service Layer v2\n")
+		b.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
+		b.WriteString(fmt.Sprintf("// Generated at %s\n\n", generatedAt))
+		b.WriteString("import { z } from 'zod';\n\n")
+
+		for _, en := range allEnums {
+			b.WriteString(generateZodEnum(en))
+		}
+
+		enumsPath := filepath.Join(outDir, "enums.ts")
+		if err := writeFile(enumsPath, b.String()); err != nil {
+			return fmt.Errorf("writing enums.ts: %w", err)
+		}
+		log.Printf("Wrote %s", enumsPath)
+	}
+
+	// 2) Write per-entity files
+	entityDir := filepath.Join(outDir, "entities")
+	if err := ensureDir(entityDir); err != nil {
+		return err
+	}
+	entityNames := make([]string, 0, len(allEntities))
+	for _, et := range allEntities {
+		fileName, content := renderPerTypeFile(et, true, entitySet, complexSet, enumSet, generatedAt)
+		target := filepath.Join(entityDir, fileName)
+		if err := writeFile(target, content); err != nil {
+			return fmt.Errorf("writing entity file %s: %w", target, err)
+		}
+		entityNames = append(entityNames, strings.TrimSuffix(fileName, ".ts"))
+		log.Printf("Wrote %s", target)
+	}
+
+	// 3) Write per-complex files
+	complexDir := filepath.Join(outDir, "complex")
+	if err := ensureDir(complexDir); err != nil {
+		return err
+	}
+	complexNames := make([]string, 0, len(allComplexes))
+	for _, ct := range allComplexes {
+		fileName, content := renderPerTypeFile(ct, false, entitySet, complexSet, enumSet, generatedAt)
+		target := filepath.Join(complexDir, fileName)
+		if err := writeFile(target, content); err != nil {
+			return fmt.Errorf("writing complex file %s: %w", target, err)
+		}
+		complexNames = append(complexNames, strings.TrimSuffix(fileName, ".ts"))
+		log.Printf("Wrote %s", target)
+	}
+
+	// 4) Barrel files
+	// entities/index.ts
+	{
+		sort.Strings(entityNames)
+		var b strings.Builder
+		b.WriteString("// Barrel file for entity schemas\n")
+		for _, n := range entityNames {
+			b.WriteString(fmt.Sprintf("export * from './%s';\n", n))
+		}
+		if err := writeFile(filepath.Join(entityDir, "index.ts"), b.String()); err != nil {
+			return err
 		}
 	}
-	return b.String()
+	// complex/index.ts
+	{
+		sort.Strings(complexNames)
+		var b strings.Builder
+		b.WriteString("// Barrel file for complex schemas\n")
+		for _, n := range complexNames {
+			b.WriteString(fmt.Sprintf("export * from './%s';\n", n))
+		}
+		if err := writeFile(filepath.Join(complexDir, "index.ts"), b.String()); err != nil {
+			return err
+		}
+	}
+	// root index.ts
+	{
+		var b strings.Builder
+		b.WriteString("// Root barrel file\n")
+		b.WriteString("export * from './enums';\n")
+		b.WriteString("export * from './entities';\n")
+		b.WriteString("export * from './complex';\n")
+		if err := writeFile(filepath.Join(outDir, "index.ts"), b.String()); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func safeFieldName(name string) string {
-	n := goExported(name)
-	// Avoid Go keywords by suffixing underscore
-	switch n {
-	case "break", "default", "func", "interface", "select",
-		"case", "defer", "go", "map", "struct",
-		"chan", "else", "goto", "package", "switch",
-		"const", "fallthrough", "if", "range", "type",
-		"continue", "for", "import", "return", "var":
-		return n + "_"
-	}
-	return n
-}
+// ---------- Main (supports single file or per-type split) ----------
 
-func boolOrDefault(p *bool, d bool) bool {
-	if p == nil {
-		return d
+func main() {
+	inputFile := flag.String("input", "", "Path to the EDMX XML file")
+	outputFile := flag.String("output", "types.ts", "Path to the output TS file for -split=single")
+	outDir := flag.String("outDir", "types", "Directory to write TS files for -split=perType")
+	splitMode := flag.String("split", "perType", "Output mode: single | perType")
+	dumpParsed := flag.Bool("dump", false, "Dump parsed XML structure to debug.xml")
+	flag.Parse()
+
+	if *inputFile == "" {
+		log.Fatal("Please provide -input flag with the XML file path")
 	}
-	return *p
+
+	data, err := ioutil.ReadFile(*inputFile)
+	if err != nil {
+		log.Fatalf("Error reading XML file: %v", err)
+	}
+
+	var edmx EDMX
+	if err := xml.Unmarshal(data, &edmx); err != nil {
+		log.Fatalf("Error unmarshaling XML: %v", err)
+	}
+
+	log.Printf("Parsed EDMX Version: %s", edmx.Version)
+	log.Printf("Parsed %d schemas", len(edmx.DataServices.Schemas))
+
+	if *dumpParsed {
+		dumpParsedXML(&edmx, "debug.xml")
+	}
+
+	switch *splitMode {
+	case "single":
+		var output strings.Builder
+		output.WriteString("// Generated Zod schemas from OData EDMX for SAP Business One Service Layer v2\n")
+		output.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
+		output.WriteString(fmt.Sprintf("// Generated at %s\n\n", time.Now().Format(time.RFC3339)))
+
+		// TS imports
+		output.WriteString("import { z, ZodType } from 'zod';\n\n")
+
+		// First, collect and generate ALL enums from ALL schemas to minimize forward refs
+		allEnums := make(map[string]string)
+		for i, schema := range edmx.DataServices.Schemas {
+			for _, en := range schema.EnumTypes {
+				enumCode := generateZodEnum(en)
+				allEnums[en.Name] = enumCode
+				log.Printf("  Pre-generated EnumType Schema: %s from schema %d", en.Name, i+1)
+			}
+		}
+
+		// Output all enums first
+		for _, enumCode := range allEnums {
+			output.WriteString(enumCode)
+		}
+
+		// Generate TS model types (NameModel) for all entities/complex first
+		var allModelTypes strings.Builder
+		for _, schema := range edmx.DataServices.Schemas {
+			for _, et := range schema.EntityTypes {
+				allModelTypes.WriteString(generateTsModelType(et))
+			}
+			for _, ct := range schema.ComplexTypes {
+				allModelTypes.WriteString(generateTsModelType(ct))
+			}
+		}
+		output.WriteString(allModelTypes.String())
+
+		// Now generate Zod object schemas (entities/complex) for all schemas
+		generatedCount := len(allEnums)
+		for i, schema := range edmx.DataServices.Schemas {
+			log.Printf("Processing schema %d: %s (Alias: %s)", i+1, schema.Namespace, schema.Alias)
+			log.Printf("  - %d EntityTypes", len(schema.EntityTypes))
+			log.Printf("  - %d ComplexTypes", len(schema.ComplexTypes))
+
+			for _, et := range schema.EntityTypes {
+				output.WriteString(generateZodSchema(et, true, schema.Namespace))
+				generatedCount++
+				log.Printf("  Generated EntityType Schema: %s", et.Name)
+			}
+			for _, ct := range schema.ComplexTypes {
+				output.WriteString(generateZodSchema(ct, false, schema.Namespace))
+				generatedCount++
+				log.Printf("  Generated ComplexType Schema: %s", ct.Name)
+			}
+		}
+
+		if generatedCount == 0 {
+			log.Println("Warning: No types generated.")
+			output.WriteString("// No schemas found in metadata.\n")
+		} else {
+			log.Printf("Successfully generated %d schemas (including %d enums)", generatedCount, len(allEnums))
+		}
+
+		err = ioutil.WriteFile(*outputFile, []byte(output.String()), 0644)
+		if err != nil {
+			log.Fatalf("Error writing output file: %v", err)
+		}
+		log.Printf("Generated Zod schemas in %s", *outputFile)
+
+	case "perType":
+		if err := writePerTypeOutputs(&edmx, *outDir); err != nil {
+			log.Fatalf("Error generating per-type outputs: %v", err)
+		}
+		log.Printf("Generated per-type TS files in %s", *outDir)
+
+	default:
+		log.Fatalf("Unknown -split mode: %s (use 'single' or 'perType')", *splitMode)
+	}
 }
