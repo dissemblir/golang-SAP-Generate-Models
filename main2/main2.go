@@ -1,4 +1,4 @@
-package main
+package main2
 
 import (
 	"encoding/xml"
@@ -9,18 +9,18 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // Usage examples:
-//   Split per type (recommended for editor performance):
+//   Split per type (recommended):
 //     go run main.go -input="metadata.xml" -outDir="./types" -split="perType"
-//   Single file (legacy, heavier for editors):
+//   Single file (legacy):
 //     go run main.go -input="metadata.xml" -output="types.ts" -split="single"
 
-// ---------------------- EDMX parsing types ----------------------
-
+// (Same XML parsing structs as before - unchanged for SAP B1 compatibility)
 type EDMX struct {
 	XMLName      xml.Name     `xml:"http://docs.oasis-open.org/odata/ns/edmx Edmx"`
 	Version      string       `xml:"Version,attr"`
@@ -115,30 +115,29 @@ type EntitySet struct {
 	EntityType string   `xml:"EntityType,attr"`
 }
 
-// ---------------------- Type mappings ----------------------
-
-// Zod runtime mapping (as emitted TS code uses "$z" which is "const $z: any = z")
+// Type mappings from EDM primitive types to Zod (keys without "Edm." prefix).
 var edmToZod = map[string]string{
-	"String":         "$z.string()",
-	"Int16":          "$z.number().int()",
-	"Int32":          "$z.number().int()",
-	"Int64":          "$z.number().int()",
-	"Byte":           "$z.number().int().nonnegative().max(255)",
-	"SByte":          "$z.number().int().min(-128).max(127)",
-	"Boolean":        "$z.boolean()",
-	"Decimal":        "$z.number()", // Or "$z.string()" for precision
-	"Double":         "$z.number()",
-	"Single":         "$z.number()",
-	"Guid":           "$z.string().uuid()",
-	"Date":           "$z.coerce.date()",
-	"DateTimeOffset": "$z.coerce.date()",
-	"TimeOfDay":      "$z.string()",
-	"Binary":         "$z.instanceof(Uint8Array)",
-	"Stream":         "$z.instanceof(Uint8Array)",
-	"Duration":       "$z.string()",
+	"String":         "z.string()",
+	"Int16":          "z.number().int()",
+	"Int32":          "z.number().int()",
+	"Int64":          "z.number().int()",
+	"Byte":           "z.number().int().nonnegative().max(255)",
+	"SByte":          "z.number().int().min(-128).max(127)",
+	"Boolean":        "z.boolean()",
+	"Decimal":        "z.number()", // Or "z.string()" for precision
+	"Double":         "z.number()",
+	"Single":         "z.number()",
+	"Guid":           "z.string().uuid()",
+	"Date":           "z.coerce.date()", // Use coerce directly so it accepts both Date and ISO string inputs
+	"DateTimeOffset": "z.coerce.date()",
+	"TimeOfDay":      "z.string()", // TimeOfDay is typically "HH:MM:SS" and not reliably parseable by Date(), so keep it as string. (Change if your API returns full ISO timestamps.)
+	"Binary":         "z.instanceof(Uint8Array)",
+	"Stream":         "z.instanceof(Uint8Array)",
+	"Duration":       "z.string()",
 }
 
-// TypeScript model mapping (final output type after Zod pipelines)
+// Type mappings from EDM primitive types to TypeScript types.
+// Align these with the final output type of your Zod pipelines.
 var edmToTs = map[string]string{
 	"String":         "string",
 	"Int16":          "number",
@@ -151,26 +150,26 @@ var edmToTs = map[string]string{
 	"Double":         "number",
 	"Single":         "number",
 	"Guid":           "string",
-	"Date":           "Date",
+	"Date":           "Date", // because of z.coerce.date()
 	"DateTimeOffset": "Date",
-	"TimeOfDay":      "string", // keep as string
+	"TimeOfDay":      "Date", // mapped via coerce
 	"Binary":         "Uint8Array",
 	"Stream":         "Uint8Array",
 	"Duration":       "string",
 }
 
-// ---------------------- helpers ----------------------
-
+// Helper to extract the type name without namespace.
 func extractEdmTypeName(edmType string) string {
 	fullType := strings.TrimPrefix(edmType, "Collection(")
 	fullType = strings.TrimSuffix(fullType, ")")
 	split := strings.SplitN(fullType, ".", 2)
 	if len(split) == 2 {
-		return split[1]
+		return split[1] // Local name
 	}
 	return fullType
 }
 
+// Helper to determine if a type is collection and get inner type.
 func isCollection(t string) (bool, string) {
 	if strings.HasPrefix(t, "Collection(") && strings.HasSuffix(t, ")") {
 		return true, t[11 : len(t)-1]
@@ -178,6 +177,7 @@ func isCollection(t string) (bool, string) {
 	return false, t
 }
 
+// Get TypeScript type string for a given EDM type.
 func getTsType(edmType string) string {
 	isColl, innerEdm := isCollection(edmType)
 	innerName := extractEdmTypeName(innerEdm)
@@ -186,6 +186,7 @@ func getTsType(edmType string) string {
 	if ts, ok := edmToTs[innerName]; ok {
 		baseTs = ts
 	} else if innerName != "" {
+		// Non-primitive: reference the generated friendly type (enum or complex/entity)
 		baseTs = strings.Title(innerName)
 	} else {
 		baseTs = "unknown"
@@ -198,7 +199,8 @@ func getTsType(edmType string) string {
 	return baseTs
 }
 
-func getZodType(edmType string, _ bool, targetSchemaName string) string {
+// Get Zod type string for a given EDM type, wrapping refs in z.lazy for cycles/forward refs.
+func getZodType(edmType string, isNullable bool, targetSchemaName string) string {
 	isColl, innerEdm := isCollection(edmType)
 	innerName := extractEdmTypeName(innerEdm)
 
@@ -206,17 +208,18 @@ func getZodType(edmType string, _ bool, targetSchemaName string) string {
 	if zod, ok := edmToZod[innerName]; ok {
 		baseZod = zod
 	} else if innerName != "" {
+		// Non-primitive: reference the schema (enum or complex/entity).
 		if targetSchemaName == "" {
-			targetSchemaName = strings.Title(innerName) + "Schema"
+			targetSchemaName = innerName + "Schema"
 		}
-		baseZod = fmt.Sprintf("$z.lazy(() => %s)", targetSchemaName)
+		baseZod = fmt.Sprintf("z.lazy(() => %s)", targetSchemaName)
 	} else {
-		baseZod = "$z.unknown()"
-		log.Printf("Warning: Unknown type '%s' for field, using unknown()", edmType)
+		baseZod = "z.unknown()"
+		log.Printf("Warning: Unknown type '%s' for field, using z.unknown()", edmType)
 	}
 
 	if isColl {
-		baseZod = fmt.Sprintf("$z.array(%s)", baseZod)
+		baseZod = fmt.Sprintf("z.array(%s)", baseZod)
 		baseZod += ".nullish()"
 		return baseZod
 	}
@@ -225,8 +228,8 @@ func getZodType(edmType string, _ bool, targetSchemaName string) string {
 	return baseZod
 }
 
-// ---------------------- TS code generation ----------------------
-
+// Generate a TypeScript model type alias (used to break TS inference cycles).
+// We generate NameModel instead of Name to preserve your existing export `type Name = z.infer<...>`
 func generateTsModelType(typ interface{}) string {
 	var name string
 	var props []Property
@@ -247,10 +250,14 @@ func generateTsModelType(typ interface{}) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("export type %s = {\n", tsTypeName))
 
+	// Scalar properties
 	for _, p := range props {
 		tsType := getTsType(p.Type)
+		// Allow nulls commonly returned by the service: T | null, and property optional
 		b.WriteString(fmt.Sprintf("  %s?: %s | null;\n", p.Name, tsType))
 	}
+
+	// Navigation properties
 	for _, n := range navs {
 		target := extractEdmTypeName(n.Type)
 		targetTs := strings.Title(target)
@@ -265,10 +272,7 @@ func generateTsModelType(typ interface{}) string {
 	return b.String()
 }
 
-// Generate Zod schema for EntityType or ComplexType.
-// Fast-LSP mode: use $z (any) and cast initializer to ZodType<NameModel>.
-// Also add aliasing preprocessor: if a prop ends with "Property" and alias (without suffix)
-// appears in payload, copy alias -> canonical before validation.
+// Generate Zod schema for EntityType or ComplexType (as TS code string).
 func generateZodSchema(typ interface{}, isEntity bool, schemaNs string) string {
 	var name string
 	var props []Property
@@ -285,16 +289,17 @@ func generateZodSchema(typ interface{}, isEntity bool, schemaNs string) string {
 		navs = t.NavigationProperties
 	}
 
-	schemaName := strings.Title(name) + "Schema"
-	tsModelName := strings.Title(name) + "Model"
-	tsTypeName := strings.Title(name)
+	schemaName := strings.Title(name) + "Schema" // e.g., "ActivitySchema"
+	tsModelName := strings.Title(name) + "Model" // e.g., "ActivityModel"
+	tsTypeName := strings.Title(name)            // e.g., "Activity"
 
-	// Build set of prop names
+	// Build a set of all property names for conflict checks
 	propNames := make(map[string]struct{}, len(props))
 	for _, p := range props {
 		propNames[p.Name] = struct{}{}
 	}
 
+	// Collect alias pairs: <alias -> canonical> like Activity -> ActivityProperty
 	type aliasPair struct{ alias, canonical string }
 	var aliases []aliasPair
 	for _, p := range props {
@@ -308,12 +313,15 @@ func generateZodSchema(typ interface{}, isEntity bool, schemaNs string) string {
 		}
 	}
 
+	// Build the object shape
 	var shape strings.Builder
+	// Scalar props
 	for _, p := range props {
 		fieldKey := p.Name
 		zodType := getZodType(p.Type, p.Nullable, "")
 		shape.WriteString(fmt.Sprintf("\t%s: %s,\n", fieldKey, zodType))
 	}
+	// Navigation props
 	for _, n := range navs {
 		fieldKey := n.Name
 		targetName := extractEdmTypeName(n.Type)
@@ -321,44 +329,39 @@ func generateZodSchema(typ interface{}, isEntity bool, schemaNs string) string {
 		isColl, _ := isCollection(n.Type)
 		var zodType string
 		if isColl {
-			zodType = fmt.Sprintf("$z.array($z.lazy(() => %s)).nullish()", targetSchema)
+			zodType = fmt.Sprintf("z.array(z.lazy(() => %s))", targetSchema) + ".nullish()"
 		} else {
-			zodType = fmt.Sprintf("$z.lazy(() => %s).nullish()", targetSchema)
+			zodType = fmt.Sprintf("z.lazy(() => %s)", targetSchema) + ".nullish()"
 		}
 		shape.WriteString(fmt.Sprintf("\t%s: %s,\n", fieldKey, zodType))
 	}
 
 	var out strings.Builder
 	if len(aliases) > 0 {
-		out.WriteString(fmt.Sprintf("export const %s: ZodType<%s> = $z.preprocess((raw) => {\n", schemaName, tsModelName))
+		// Wrap with a preprocessor that copies alias → canonical
+		out.WriteString(fmt.Sprintf("export const %s: ZodType<%s> = z.preprocess((raw) => {\n", schemaName, tsModelName))
 		out.WriteString("  if (raw && typeof raw === 'object') {\n")
 		out.WriteString("    const v: any = raw as any;\n")
 		out.WriteString("    const out: any = { ...v };\n")
 		for _, a := range aliases {
-			out.WriteString(fmt.Sprintf("    if (out['%s'] == null && v['%s'] != null) out['%s'] = v['%s'];\n",
-				a.canonical, a.alias, a.canonical, a.alias))
+			out.WriteString(fmt.Sprintf("    if (out['%s'] == null && v['%s'] != null) out['%s'] = v['%s'];\n", a.canonical, a.alias, a.canonical, a.alias))
 		}
 		out.WriteString("    return out;\n")
 		out.WriteString("  }\n")
 		out.WriteString("  return raw;\n")
-		out.WriteString(fmt.Sprintf("}, $z.object({\n%s}));\n", shape.String()))
-		out.WriteString(fmt.Sprintf("export const _%s: ZodType<%s> = undefined as unknown as ZodType<%s>;\n", schemaName, tsModelName, tsModelName))
-		// Cast initializer (keep the declared one; the extra const silences some editors about inferred types)
-		out.WriteString(fmt.Sprintf("// Cast to keep type-checking light\n"))
-		out.WriteString(fmt.Sprintf("// @ts-expect-error cast to ZodType to avoid deep generic checking\n"))
-		out.WriteString(fmt.Sprintf("%s as unknown as ZodType<%s>;\n", schemaName, tsModelName))
+		out.WriteString(fmt.Sprintf("}, z.object({\n%s}));\n", shape.String()))
 	} else {
-		out.WriteString(fmt.Sprintf("export const %s: ZodType<%s> = $z.object({\n", schemaName, tsModelName))
+		// No aliases needed
+		out.WriteString(fmt.Sprintf("export const %s: ZodType<%s> = z.object({\n", schemaName, tsModelName))
 		out.WriteString(shape.String())
-		out.WriteString("}) as unknown as ZodType<" + tsModelName + ">;\n")
+		out.WriteString("});\n")
 	}
 
-	// Export a lightweight type alias (no z.infer)
-	out.WriteString(fmt.Sprintf("export type %s = %s;\n\n", tsTypeName, tsModelName))
+	out.WriteString(fmt.Sprintf("export type %s = z.infer<typeof %s>;\n\n", tsTypeName, schemaName))
 	return out.String()
 }
 
-// Lowercase first letter (SAP B1 JSON enum quirk) e.g., "PsNo" -> "psNo"
+// Helper to convert enum member name to SAP B1 JSON string casing (lowercase first letter).
 func toSapJsonEnumValue(memberName string) string {
 	if len(memberName) == 0 {
 		return memberName
@@ -366,48 +369,43 @@ func toSapJsonEnumValue(memberName string) string {
 	return strings.ToLower(memberName[0:1]) + memberName[1:]
 }
 
-// Generate enums as a union type + schema built from a constant values array.
-// Avoid z.infer to keep types light.
+// Generate TS enum + Zod schema for EnumType, handling SAP B1 string casing in JSON.
 func generateZodEnum(e EnumType) string {
-	// Build list of JSON string values
-	values := make([]string, 0, len(e.Members))
+	var members strings.Builder
+	members.WriteString(fmt.Sprintf("export const %s = {\n", e.Name))
+
+	currentValue := 0
 	for _, m := range e.Members {
-		values = append(values, toSapJsonEnumValue(m.Name))
-	}
-
-	// De-duplicate if needed
-	seen := map[string]bool{}
-	uniq := make([]string, 0, len(values))
-	for _, v := range values {
-		if !seen[v] {
-			seen[v] = true
-			uniq = append(uniq, v)
+		var valStr string
+		jsonValue := toSapJsonEnumValue(m.Name)
+		if m.Value != "" {
+			val, err := strconv.Atoi(m.Value)
+			if err != nil {
+				valStr = fmt.Sprintf("%d /* parsed error: %s */", currentValue, m.Value)
+			} else {
+				valStr = fmt.Sprintf("%d", val)
+				currentValue = val + 1
+			}
+		} else {
+			valStr = fmt.Sprintf("%d", currentValue)
+			currentValue++
 		}
+		memberName := strings.Title(m.Name) // PascalCase for TS key
+		members.WriteString(fmt.Sprintf("\t%s: '%s', // numeric value: %s\n", memberName, jsonValue, valStr))
 	}
+	members.WriteString("} as const;\n\n")
 
-	var b strings.Builder
-	// Type union
-	b.WriteString(fmt.Sprintf("export type %s = ", e.Name))
-	for i, v := range uniq {
-		if i > 0 {
-			b.WriteString(" | ")
-		}
-		b.WriteString(fmt.Sprintf("'%s'", v))
-	}
-	b.WriteString(";\n\n")
+	// Type from const
+	members.WriteString(fmt.Sprintf("export type %s = typeof %s[keyof typeof %s];\n\n", e.Name, e.Name, e.Name))
 
-	// Values array and schema
-	b.WriteString(fmt.Sprintf("export const %sValues = [\n", e.Name))
-	for _, v := range uniq {
-		b.WriteString(fmt.Sprintf("  '%s',\n", v))
-	}
-	b.WriteString(fmt.Sprintf("] as const;\n"))
-	b.WriteString(fmt.Sprintf("export const %sSchema = $z.enum(%sValues);\n\n", e.Name, e.Name))
-	return b.String()
+	// Zod schema using z.enum with the JSON string values
+	schemaName := e.Name + "Schema"
+	members.WriteString(fmt.Sprintf("export const %s = z.enum(Object.values(%s));\n", schemaName, e.Name))
+	members.WriteString(fmt.Sprintf("export type %sType = z.infer<typeof %s>;\n\n", e.Name, schemaName))
+	return members.String()
 }
 
-// ---------------------- I/O helpers ----------------------
-
+// Debug function to dump parsed structure as XML.
 func dumpParsedXML(edmx *EDMX, filename string) {
 	data, err := xml.MarshalIndent(edmx, "", "  ")
 	if err != nil {
@@ -417,6 +415,8 @@ func dumpParsedXML(edmx *EDMX, filename string) {
 	_ = ioutil.WriteFile(filename, data, 0644)
 	log.Printf("Dumped parsed structure to %s for debugging", filename)
 }
+
+// ---------- Splitting helpers ----------
 
 func ensureDir(dir string) error {
 	return os.MkdirAll(dir, 0755)
@@ -438,7 +438,14 @@ func toSortedSlice(set map[string]struct{}) []string {
 	return out
 }
 
-// Collect enum and type deps referenced by a type
+func makeSet(values []string) map[string]struct{} {
+	s := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		s[v] = struct{}{}
+	}
+	return s
+}
+
 func collectTypeAndEnumDeps(
 	typ interface{},
 	entitySet map[string]struct{},
@@ -474,6 +481,7 @@ func collectTypeAndEnumDeps(
 			enumDeps[name] = struct{}{}
 			return
 		}
+		// else it's entity or complex
 		if _, ok := entitySet[name]; ok {
 			typeDeps[name] = struct{}{}
 			return
@@ -482,14 +490,18 @@ func collectTypeAndEnumDeps(
 			typeDeps[name] = struct{}{}
 			return
 		}
+		// unknown type name, still add as type dep to be safe
 		typeDeps[name] = struct{}{}
 	}
 
+	// scalar properties
 	for _, p := range props {
 		_, inner := isCollection(p.Type)
 		innerName := extractEdmTypeName(inner)
 		addType(innerName)
 	}
+
+	// navigation properties always point to entity or collection of entity
 	for _, n := range navs {
 		_, inner := isCollection(n.Type)
 		innerName := extractEdmTypeName(inner)
@@ -499,7 +511,6 @@ func collectTypeAndEnumDeps(
 	return
 }
 
-// Render a per-type TS file (entity or complex)
 func renderPerTypeFile(
 	typ interface{},
 	isEntity bool,
@@ -518,20 +529,25 @@ func renderPerTypeFile(
 	titleName := strings.Title(name)
 	fileName = titleName + ".ts"
 
+	// Collect dependencies
 	typeDeps, enumDeps := collectTypeAndEnumDeps(typ, entitySet, complexSet, enumSet)
 	typeDepNames := toSortedSlice(typeDeps)
 	enumDepNames := toSortedSlice(enumDeps)
 
+	// Build imports
 	var b strings.Builder
+
 	b.WriteString("// Generated from OData EDMX for SAP Business One Service Layer v2\n")
 	b.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
 	b.WriteString(fmt.Sprintf("// Generated at %s\n\n", generatedAt))
 	b.WriteString("import { z, ZodType } from 'zod';\n")
-	b.WriteString("const $z: any = z;\n")
 
+	// Enums: import type + schema in one module
 	if len(enumDepNames) > 0 {
+		// type imports
 		b.WriteString(fmt.Sprintf("import type { %s } from '../enums';\n",
 			strings.Join(enumDepNames, ", ")))
+		// value imports (schemas)
 		enumSchemas := make([]string, 0, len(enumDepNames))
 		for _, e := range enumDepNames {
 			enumSchemas = append(enumSchemas, e+"Schema")
@@ -539,8 +555,10 @@ func renderPerTypeFile(
 		b.WriteString(fmt.Sprintf("import { %s } from '../enums';\n", strings.Join(enumSchemas, ", ")))
 	}
 
+	// Type deps: import type and schema from correct folders
 	for _, dep := range typeDepNames {
 		depPath := ""
+		// decide folder and relative path
 		if _, ok := entitySet[dep]; ok {
 			if isEntity {
 				depPath = "./" + strings.Title(dep)
@@ -554,9 +572,16 @@ func renderPerTypeFile(
 				depPath = "./" + strings.Title(dep)
 			}
 		} else {
-			depPath = "./" + strings.Title(dep)
+			// fallback assume entity in sibling (better than nothing)
+			if isEntity {
+				depPath = "./" + strings.Title(dep)
+			} else {
+				depPath = "./" + strings.Title(dep)
+			}
 		}
+		// type-only import for friendly type
 		b.WriteString(fmt.Sprintf("import type { %s } from '%s';\n", strings.Title(dep), depPath))
+		// schema import
 		b.WriteString(fmt.Sprintf("import { %sSchema } from '%s';\n", strings.Title(dep), depPath))
 	}
 
@@ -564,6 +589,7 @@ func renderPerTypeFile(
 		b.WriteString("\n")
 	}
 
+	// Model + Schema
 	b.WriteString(generateTsModelType(typ))
 	b.WriteString(generateZodSchema(typ, isEntity, ""))
 
@@ -571,9 +597,13 @@ func renderPerTypeFile(
 	return
 }
 
-func writePerTypeOutputs(edmx *EDMX, outDir string) error {
+func writePerTypeOutputs(
+	edmx *EDMX,
+	outDir string,
+) error {
 	generatedAt := time.Now().Format(time.RFC3339)
 
+	// Index sets for quick lookups
 	enumSet := map[string]struct{}{}
 	entitySet := map[string]struct{}{}
 	complexSet := map[string]struct{}{}
@@ -598,14 +628,13 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 		complexSet[c.Name] = struct{}{}
 	}
 
-	// enums.ts
+	// 1) Write enums.ts
 	{
 		var b strings.Builder
 		b.WriteString("// Generated enums from OData EDMX for SAP Business One Service Layer v2\n")
 		b.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
 		b.WriteString(fmt.Sprintf("// Generated at %s\n\n", generatedAt))
-		b.WriteString("import { z } from 'zod';\n")
-		b.WriteString("const $z: any = z;\n\n")
+		b.WriteString("import { z } from 'zod';\n\n")
 
 		for _, en := range allEnums {
 			b.WriteString(generateZodEnum(en))
@@ -618,7 +647,7 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 		log.Printf("Wrote %s", enumsPath)
 	}
 
-	// entities
+	// 2) Write per-entity files
 	entityDir := filepath.Join(outDir, "entities")
 	if err := ensureDir(entityDir); err != nil {
 		return err
@@ -634,7 +663,7 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 		log.Printf("Wrote %s", target)
 	}
 
-	// complex
+	// 3) Write per-complex files
 	complexDir := filepath.Join(outDir, "complex")
 	if err := ensureDir(complexDir); err != nil {
 		return err
@@ -650,7 +679,8 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 		log.Printf("Wrote %s", target)
 	}
 
-	// barrels
+	// 4) Barrel files
+	// entities/index.ts
 	{
 		sort.Strings(entityNames)
 		var b strings.Builder
@@ -662,6 +692,7 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 			return err
 		}
 	}
+	// complex/index.ts
 	{
 		sort.Strings(complexNames)
 		var b strings.Builder
@@ -673,6 +704,7 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 			return err
 		}
 	}
+	// root index.ts
 	{
 		var b strings.Builder
 		b.WriteString("// Root barrel file\n")
@@ -687,9 +719,9 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 	return nil
 }
 
-// ---------------------- main ----------------------
+// ---------- Main (supports single file or per-type split) ----------
 
-func main() {
+func main2() {
 	inputFile := flag.String("input", "", "Path to the EDMX XML file")
 	outputFile := flag.String("output", "types.ts", "Path to the output TS file for -split=single")
 	outDir := flag.String("outDir", "types", "Directory to write TS files for -split=perType")
@@ -724,33 +756,38 @@ func main() {
 		output.WriteString("// Generated Zod schemas from OData EDMX for SAP Business One Service Layer v2\n")
 		output.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
 		output.WriteString(fmt.Sprintf("// Generated at %s\n\n", time.Now().Format(time.RFC3339)))
-		output.WriteString("import { z, ZodType } from 'zod';\n")
-		output.WriteString("const $z: any = z;\n\n")
 
-		// Enums first
+		// TS imports
+		output.WriteString("import { z, ZodType } from 'zod';\n\n")
+
+		// First, collect and generate ALL enums from ALL schemas to minimize forward refs
 		allEnums := make(map[string]string)
 		for i, schema := range edmx.DataServices.Schemas {
 			for _, en := range schema.EnumTypes {
 				enumCode := generateZodEnum(en)
 				allEnums[en.Name] = enumCode
-				log.Printf("  Pre-generated EnumType: %s (schema %d)", en.Name, i+1)
+				log.Printf("  Pre-generated EnumType Schema: %s from schema %d", en.Name, i+1)
 			}
 		}
+
+		// Output all enums first
 		for _, enumCode := range allEnums {
 			output.WriteString(enumCode)
 		}
 
-		// Models next
+		// Generate TS model types (NameModel) for all entities/complex first
+		var allModelTypes strings.Builder
 		for _, schema := range edmx.DataServices.Schemas {
 			for _, et := range schema.EntityTypes {
-				output.WriteString(generateTsModelType(et))
+				allModelTypes.WriteString(generateTsModelType(et))
 			}
 			for _, ct := range schema.ComplexTypes {
-				output.WriteString(generateTsModelType(ct))
+				allModelTypes.WriteString(generateTsModelType(ct))
 			}
 		}
+		output.WriteString(allModelTypes.String())
 
-		// Schemas last
+		// Now generate Zod object schemas (entities/complex) for all schemas
 		generatedCount := len(allEnums)
 		for i, schema := range edmx.DataServices.Schemas {
 			log.Printf("Processing schema %d: %s (Alias: %s)", i+1, schema.Namespace, schema.Alias)
@@ -792,11 +829,3 @@ func main() {
 		log.Fatalf("Unknown -split mode: %s (use 'single' or 'perType')", *splitMode)
 	}
 }
-
-// ---------------------- Notes ----------------------
-// - Fast-LSP mode removes z.infer usage for exported types and casts Zod initializers,
-//   drastically reducing TypeScript's type-checking work.
-// - Dates are parsed with $z.coerce.date() and fields are .nullish().
-// - Enums are emitted as string unions plus $z.enum([...]) schemas.
-// - Aliases: For any property ending with "Property", the schema accepts the alias
-//   (without "Property") in the payload and copies it to the canonical key before validation.
