@@ -13,13 +13,30 @@ import (
 	"time"
 )
 
-// Usage examples:
-//   Split per type (recommended for editor performance):
-//     go run main.go -input="metadata.xml" -outDir="./types" -split="perType"
-//   Single file (legacy, heavier for editors):
-//     go run main.go -input="metadata.xml" -output="types.ts" -split="single"
+/*
+Generator: ArkType-only output (no Zod, no TS inference export)
 
-// ---------------------- EDMX parsing types ----------------------
+- Emits ArkType validators with `type({ ... })` or type("...'a'|'b'...")
+- Each property is optional and allows null: "FieldName?": "<base>|null"
+- Collections: "<base>[]|null"
+- Enums: "'A'|'B'|...'"; used directly in property DSL when referenced
+- Navigation properties: shallow "object|null" or "object[]|null" (no cross-file linking)
+- No `export type Foo = Infer<...>` lines (you said you'll infer yourself)
+- No index/barrel files (prevents pulling everything into the editor at once)
+
+SPECIAL CASE (SAP B1 quirk):
+- If a property name ends with "Property" (e.g., "ActivityProperty") and there is
+  no sibling property with the alias name (e.g., "Activity"), we emit the alias key
+  instead, e.g. "Activity?" in the ArkType shape. This matches actual JSON payloads.
+
+Usage:
+  Split per type (recommended):
+    go run main.go -input="metadata.xml" -outDir="./types" -split="perType"
+  Single file (legacy):
+    go run main.go -input="metadata.xml" -output="types.ts" -split="single"
+*/
+
+// ========================= EDMX parsing types =========================
 
 type EDMX struct {
 	XMLName      xml.Name     `xml:"http://docs.oasis-open.org/odata/ns/edmx Edmx"`
@@ -115,31 +132,9 @@ type EntitySet struct {
 	EntityType string   `xml:"EntityType,attr"`
 }
 
-// ---------------------- Type mappings ----------------------
+// ========================= Type mappings =========================
 
-// Zod runtime mapping (as emitted TS code uses "$z" which is "const $z: any = z")
-var edmToZod = map[string]string{
-	"String":         "$z.string()",
-	"Int16":          "$z.number().int()",
-	"Int32":          "$z.number().int()",
-	"Int64":          "$z.number().int()",
-	"Byte":           "$z.number().int().nonnegative().max(255)",
-	"SByte":          "$z.number().int().min(-128).max(127)",
-	"Boolean":        "$z.boolean()",
-	"Decimal":        "$z.number()", // Or "$z.string()" for precision
-	"Double":         "$z.number()",
-	"Single":         "$z.number()",
-	"Guid":           "$z.string().uuid()",
-	"Date":           "$z.coerce.date()",
-	"DateTimeOffset": "$z.coerce.date()",
-	"TimeOfDay":      "$z.string()",
-	"Binary":         "$z.instanceof(Uint8Array)",
-	"Stream":         "$z.instanceof(Uint8Array)",
-	"Duration":       "$z.string()",
-}
-
-// TypeScript model mapping (final output type after Zod pipelines)
-var edmToTs = map[string]string{
+var edmToArkBase = map[string]string{
 	"String":         "string",
 	"Int16":          "number",
 	"Int32":          "number",
@@ -147,19 +142,19 @@ var edmToTs = map[string]string{
 	"Byte":           "number",
 	"SByte":          "number",
 	"Boolean":        "boolean",
-	"Decimal":        "number", // or "string" if you prefer high precision
+	"Decimal":        "number", // change to "string" if your API sends decimals as strings
 	"Double":         "number",
 	"Single":         "number",
 	"Guid":           "string",
-	"Date":           "Date",
-	"DateTimeOffset": "Date",
-	"TimeOfDay":      "string", // keep as string
-	"Binary":         "Uint8Array",
-	"Stream":         "Uint8Array",
+	"Date":           "string", // ISO date string
+	"DateTimeOffset": "string", // ISO date-time string
+	"TimeOfDay":      "string", // "HH:MM:SS"
+	"Binary":         "string", // base64
+	"Stream":         "string",
 	"Duration":       "string",
 }
 
-// ---------------------- helpers ----------------------
+// ========================= Helpers =========================
 
 func extractEdmTypeName(edmType string) string {
 	fullType := strings.TrimPrefix(edmType, "Collection(")
@@ -178,98 +173,69 @@ func isCollection(t string) (bool, string) {
 	return false, t
 }
 
-func getTsType(edmType string) string {
-	isColl, innerEdm := isCollection(edmType)
-	innerName := extractEdmTypeName(innerEdm)
+// Build ArkType DSL for a property: always optional key (handled by "Field?")
+// and allow null in the value. Arrays become "<base>[]|null".
+func arkPropTypeDSL(edmType string, isEnum bool, enumVals []string) string {
+	isColl, inner := isCollection(edmType)
+	innerName := extractEdmTypeName(inner)
 
-	var baseTs string
-	if ts, ok := edmToTs[innerName]; ok {
-		baseTs = ts
-	} else if innerName != "" {
-		baseTs = strings.Title(innerName)
-	} else {
-		baseTs = "unknown"
-		log.Printf("Warning: Unknown TS type for '%s', using unknown", edmType)
-	}
-
-	if isColl {
-		return baseTs + "[]"
-	}
-	return baseTs
-}
-
-func getZodType(edmType string, _ bool, targetSchemaName string) string {
-	isColl, innerEdm := isCollection(edmType)
-	innerName := extractEdmTypeName(innerEdm)
-
-	var baseZod string
-	if zod, ok := edmToZod[innerName]; ok {
-		baseZod = zod
-	} else if innerName != "" {
-		if targetSchemaName == "" {
-			targetSchemaName = strings.Title(innerName) + "Schema"
+	// Enum literal union
+	if isEnum && len(enumVals) > 0 {
+		var parts []string
+		for _, v := range enumVals {
+			parts = append(parts, fmt.Sprintf("'%s'", v))
 		}
-		baseZod = fmt.Sprintf("$z.lazy(() => %s)", targetSchemaName)
-	} else {
-		baseZod = "$z.unknown()"
-		log.Printf("Warning: Unknown type '%s' for field, using unknown()", edmType)
+		union := strings.Join(parts, "|")
+		if isColl {
+			return union + "[]|null"
+		}
+		return union + "|null"
 	}
 
+	// Primitive
+	if base, ok := edmToArkBase[innerName]; ok {
+		if isColl {
+			return base + "[]|null"
+		}
+		return base + "|null"
+	}
+
+	// Non-primitive -> shallow
 	if isColl {
-		baseZod = fmt.Sprintf("$z.array(%s)", baseZod)
-		baseZod += ".nullish()"
-		return baseZod
+		return "object[]|null"
 	}
-
-	baseZod += ".nullish()"
-	return baseZod
+	return "object|null"
 }
 
-// ---------------------- TS code generation ----------------------
+// ========================= ArkType emission =========================
 
-func generateTsModelType(typ interface{}) string {
-	var name string
-	var props []Property
-	var navs []NavigationProperty
-
-	switch t := typ.(type) {
-	case EntityType:
-		name = t.Name
-		props = t.Properties
-		navs = t.NavigationProperties
-	case ComplexType:
-		name = t.Name
-		props = t.Properties
-		navs = t.NavigationProperties
+func generateArkEnum(e EnumType) string {
+	// Unique member names (as SAP usually returns them, e.g., "cn_Meeting")
+	seen := map[string]bool{}
+	vals := []string{}
+	for _, m := range e.Members {
+		if !seen[m.Name] {
+			seen[m.Name] = true
+			vals = append(vals, m.Name)
+		}
 	}
 
-	tsTypeName := strings.Title(name) + "Model"
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("export type %s = {\n", tsTypeName))
-
-	for _, p := range props {
-		tsType := getTsType(p.Type)
-		b.WriteString(fmt.Sprintf("  %s?: %s | null;\n", p.Name, tsType))
-	}
-	for _, n := range navs {
-		target := extractEdmTypeName(n.Type)
-		targetTs := strings.Title(target)
-		if isColl, _ := isCollection(n.Type); isColl {
-			b.WriteString(fmt.Sprintf("  %s?: %s[] | null;\n", n.Name, targetTs))
-		} else {
-			b.WriteString(fmt.Sprintf("  %s?: %s | null;\n", n.Name, targetTs))
+	b.WriteString(fmt.Sprintf("export const %sType = type(\"", e.Name))
+	for i, v := range vals {
+		if i > 0 {
+			b.WriteString("|")
 		}
+		b.WriteString(fmt.Sprintf("'%s'", v))
 	}
-
-	b.WriteString("};\n\n")
+	b.WriteString("\");\n\n")
 	return b.String()
 }
 
-// Generate Zod schema for EntityType or ComplexType.
-// Fast-LSP mode: use $z (any) and cast initializer to ZodType<NameModel>.
-// Also add aliasing preprocessor: if a prop ends with "Property" and alias (without suffix)
-// appears in payload, copy alias -> canonical before validation.
-func generateZodSchema(typ interface{}, isEntity bool, schemaNs string) string {
+// Generate ArkType object. Applies "Property" aliasing:
+// If a scalar property ends with "Property" and the alias (without suffix) does not
+// exist as a sibling, we emit the alias key instead (matches actual JSON).
+func generateArkObject(typ interface{}, enumsByName map[string][]string) string {
 	var name string
 	var props []Property
 	var navs []NavigationProperty
@@ -285,138 +251,48 @@ func generateZodSchema(typ interface{}, isEntity bool, schemaNs string) string {
 		navs = t.NavigationProperties
 	}
 
-	schemaName := strings.Title(name) + "Schema"
-	tsModelName := strings.Title(name) + "Model"
-	tsTypeName := strings.Title(name)
+	typeName := strings.Title(name)
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("export const %sType = type({\n", typeName))
 
-	// Build set of prop names
+	// Build set of existing property names to avoid alias collisions
 	propNames := make(map[string]struct{}, len(props))
 	for _, p := range props {
 		propNames[p.Name] = struct{}{}
 	}
 
-	type aliasPair struct{ alias, canonical string }
-	var aliases []aliasPair
+	// Scalar props
 	for _, p := range props {
-		if strings.HasSuffix(p.Name, "Property") {
-			alias := strings.TrimSuffix(p.Name, "Property")
+		innerName := extractEdmTypeName(p.Type)
+		enumVals, isEnum := enumsByName[innerName]
+		dsl := arkPropTypeDSL(p.Type, isEnum, enumVals)
+
+		// Alias rule: if ends with "Property" and alias key doesn't exist, use alias
+		keyName := p.Name
+		if strings.HasSuffix(keyName, "Property") {
+			alias := strings.TrimSuffix(keyName, "Property")
 			if alias != "" {
 				if _, exists := propNames[alias]; !exists {
-					aliases = append(aliases, aliasPair{alias: alias, canonical: p.Name})
+					keyName = alias
 				}
 			}
 		}
+
+		// IMPORTANT: quoted key with ? for optional
+		b.WriteString(fmt.Sprintf("  \"%s?\": \"%s\",\n", keyName, dsl))
 	}
 
-	var shape strings.Builder
-	for _, p := range props {
-		fieldKey := p.Name
-		zodType := getZodType(p.Type, p.Nullable, "")
-		shape.WriteString(fmt.Sprintf("\t%s: %s,\n", fieldKey, zodType))
-	}
+	// Navigation props (shallow) — we do not alias these
 	for _, n := range navs {
-		fieldKey := n.Name
-		targetName := extractEdmTypeName(n.Type)
-		targetSchema := strings.Title(targetName) + "Schema"
-		isColl, _ := isCollection(n.Type)
-		var zodType string
-		if isColl {
-			zodType = fmt.Sprintf("$z.array($z.lazy(() => %s)).nullish()", targetSchema)
-		} else {
-			zodType = fmt.Sprintf("$z.lazy(() => %s).nullish()", targetSchema)
-		}
-		shape.WriteString(fmt.Sprintf("\t%s: %s,\n", fieldKey, zodType))
+		dsl := arkPropTypeDSL(n.Type, false, nil)
+		b.WriteString(fmt.Sprintf("  \"%s?\": \"%s\",\n", n.Name, dsl))
 	}
 
-	var out strings.Builder
-	if len(aliases) > 0 {
-		out.WriteString(fmt.Sprintf("export const %s: ZodType<%s> = $z.preprocess((raw) => {\n", schemaName, tsModelName))
-		out.WriteString("  if (raw && typeof raw === 'object') {\n")
-		out.WriteString("    const v: any = raw as any;\n")
-		out.WriteString("    const out: any = { ...v };\n")
-		for _, a := range aliases {
-			out.WriteString(fmt.Sprintf("    if (out['%s'] == null && v['%s'] != null) out['%s'] = v['%s'];\n",
-				a.canonical, a.alias, a.canonical, a.alias))
-		}
-		out.WriteString("    return out;\n")
-		out.WriteString("  }\n")
-		out.WriteString("  return raw;\n")
-		out.WriteString(fmt.Sprintf("}, $z.object({\n%s}));\n", shape.String()))
-		out.WriteString(fmt.Sprintf("export const _%s: ZodType<%s> = undefined as unknown as ZodType<%s>;\n", schemaName, tsModelName, tsModelName))
-		// Cast initializer (keep the declared one; the extra const silences some editors about inferred types)
-		out.WriteString(fmt.Sprintf("// Cast to keep type-checking light\n"))
-		out.WriteString(fmt.Sprintf("// @ts-expect-error cast to ZodType to avoid deep generic checking\n"))
-		out.WriteString(fmt.Sprintf("%s as unknown as ZodType<%s>;\n", schemaName, tsModelName))
-	} else {
-		out.WriteString(fmt.Sprintf("export const %s: ZodType<%s> = $z.object({\n", schemaName, tsModelName))
-		out.WriteString(shape.String())
-		out.WriteString("}) as unknown as ZodType<" + tsModelName + ">;\n")
-	}
-
-	// Export a lightweight type alias (no z.infer)
-	out.WriteString(fmt.Sprintf("export type %s = %s;\n\n", tsTypeName, tsModelName))
-	return out.String()
-}
-
-// Lowercase first letter (SAP B1 JSON enum quirk) e.g., "PsNo" -> "psNo"
-func toSapJsonEnumValue(memberName string) string {
-	if len(memberName) == 0 {
-		return memberName
-	}
-	return strings.ToLower(memberName[0:1]) + memberName[1:]
-}
-
-// Generate enums as a union type + schema built from a constant values array.
-// Avoid z.infer to keep types light.
-func generateZodEnum(e EnumType) string {
-	// Build list of JSON string values
-	values := make([]string, 0, len(e.Members))
-	for _, m := range e.Members {
-		values = append(values, toSapJsonEnumValue(m.Name))
-	}
-
-	// De-duplicate if needed
-	seen := map[string]bool{}
-	uniq := make([]string, 0, len(values))
-	for _, v := range values {
-		if !seen[v] {
-			seen[v] = true
-			uniq = append(uniq, v)
-		}
-	}
-
-	var b strings.Builder
-	// Type union
-	b.WriteString(fmt.Sprintf("export type %s = ", e.Name))
-	for i, v := range uniq {
-		if i > 0 {
-			b.WriteString(" | ")
-		}
-		b.WriteString(fmt.Sprintf("'%s'", v))
-	}
-	b.WriteString(";\n\n")
-
-	// Values array and schema
-	b.WriteString(fmt.Sprintf("export const %sValues = [\n", e.Name))
-	for _, v := range uniq {
-		b.WriteString(fmt.Sprintf("  '%s',\n", v))
-	}
-	b.WriteString(fmt.Sprintf("] as const;\n"))
-	b.WriteString(fmt.Sprintf("export const %sSchema = $z.enum(%sValues);\n\n", e.Name, e.Name))
+	b.WriteString("});\n\n")
 	return b.String()
 }
 
-// ---------------------- I/O helpers ----------------------
-
-func dumpParsedXML(edmx *EDMX, filename string) {
-	data, err := xml.MarshalIndent(edmx, "", "  ")
-	if err != nil {
-		log.Printf("Error dumping parsed structure: %v", err)
-		return
-	}
-	_ = ioutil.WriteFile(filename, data, 0644)
-	log.Printf("Dumped parsed structure to %s for debugging", filename)
-}
+// ========================= I/O helpers =========================
 
 func ensureDir(dir string) error {
 	return os.MkdirAll(dir, 0755)
@@ -429,186 +305,45 @@ func writeFile(path string, content string) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
-func toSortedSlice(set map[string]struct{}) []string {
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// Collect enum and type deps referenced by a type
-func collectTypeAndEnumDeps(
-	typ interface{},
-	entitySet map[string]struct{},
-	complexSet map[string]struct{},
-	enumSet map[string]struct{},
-) (typeDeps map[string]struct{}, enumDeps map[string]struct{}) {
-	typeDeps = map[string]struct{}{}
-	enumDeps = map[string]struct{}{}
-
-	var props []Property
-	var navs []NavigationProperty
-	var selfName string
-
-	switch t := typ.(type) {
-	case EntityType:
-		selfName = t.Name
-		props = t.Properties
-		navs = t.NavigationProperties
-	case ComplexType:
-		selfName = t.Name
-		props = t.Properties
-		navs = t.NavigationProperties
-	}
-
-	addType := func(name string) {
-		if name == "" || name == selfName {
-			return
-		}
-		if _, isPrimitive := edmToZod[name]; isPrimitive {
-			return
-		}
-		if _, isEnum := enumSet[name]; isEnum {
-			enumDeps[name] = struct{}{}
-			return
-		}
-		if _, ok := entitySet[name]; ok {
-			typeDeps[name] = struct{}{}
-			return
-		}
-		if _, ok := complexSet[name]; ok {
-			typeDeps[name] = struct{}{}
-			return
-		}
-		typeDeps[name] = struct{}{}
-	}
-
-	for _, p := range props {
-		_, inner := isCollection(p.Type)
-		innerName := extractEdmTypeName(inner)
-		addType(innerName)
-	}
-	for _, n := range navs {
-		_, inner := isCollection(n.Type)
-		innerName := extractEdmTypeName(inner)
-		addType(innerName)
-	}
-
-	return
-}
-
-// Render a per-type TS file (entity or complex)
-func renderPerTypeFile(
-	typ interface{},
-	isEntity bool,
-	entitySet map[string]struct{},
-	complexSet map[string]struct{},
-	enumSet map[string]struct{},
-	generatedAt string,
-) (fileName string, content string) {
-	var name string
-	switch t := typ.(type) {
-	case EntityType:
-		name = t.Name
-	case ComplexType:
-		name = t.Name
-	}
-	titleName := strings.Title(name)
-	fileName = titleName + ".ts"
-
-	typeDeps, enumDeps := collectTypeAndEnumDeps(typ, entitySet, complexSet, enumSet)
-	typeDepNames := toSortedSlice(typeDeps)
-	enumDepNames := toSortedSlice(enumDeps)
-
-	var b strings.Builder
-	b.WriteString("// Generated from OData EDMX for SAP Business One Service Layer v2\n")
-	b.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
-	b.WriteString(fmt.Sprintf("// Generated at %s\n\n", generatedAt))
-	b.WriteString("import { z, ZodType } from 'zod';\n")
-	b.WriteString("const $z: any = z;\n")
-
-	if len(enumDepNames) > 0 {
-		b.WriteString(fmt.Sprintf("import type { %s } from '../enums';\n",
-			strings.Join(enumDepNames, ", ")))
-		enumSchemas := make([]string, 0, len(enumDepNames))
-		for _, e := range enumDepNames {
-			enumSchemas = append(enumSchemas, e+"Schema")
-		}
-		b.WriteString(fmt.Sprintf("import { %s } from '../enums';\n", strings.Join(enumSchemas, ", ")))
-	}
-
-	for _, dep := range typeDepNames {
-		depPath := ""
-		if _, ok := entitySet[dep]; ok {
-			if isEntity {
-				depPath = "./" + strings.Title(dep)
-			} else {
-				depPath = "../entities/" + strings.Title(dep)
-			}
-		} else if _, ok := complexSet[dep]; ok {
-			if isEntity {
-				depPath = "../complex/" + strings.Title(dep)
-			} else {
-				depPath = "./" + strings.Title(dep)
-			}
-		} else {
-			depPath = "./" + strings.Title(dep)
-		}
-		b.WriteString(fmt.Sprintf("import type { %s } from '%s';\n", strings.Title(dep), depPath))
-		b.WriteString(fmt.Sprintf("import { %sSchema } from '%s';\n", strings.Title(dep), depPath))
-	}
-
-	if len(enumDepNames) > 0 || len(typeDepNames) > 0 {
-		b.WriteString("\n")
-	}
-
-	b.WriteString(generateTsModelType(typ))
-	b.WriteString(generateZodSchema(typ, isEntity, ""))
-
-	content = b.String()
-	return
-}
+// ========================= Writers =========================
 
 func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 	generatedAt := time.Now().Format(time.RFC3339)
 
-	enumSet := map[string]struct{}{}
-	entitySet := map[string]struct{}{}
-	complexSet := map[string]struct{}{}
-
-	var allEnums []EnumType
-	var allEntities []EntityType
-	var allComplexes []ComplexType
-
+	// Map enum name -> values for quick lookup
+	enumsByName := map[string][]string{}
 	for _, schema := range edmx.DataServices.Schemas {
-		allEnums = append(allEnums, schema.EnumTypes...)
-		allEntities = append(allEntities, schema.EntityTypes...)
-		allComplexes = append(allComplexes, schema.ComplexTypes...)
-	}
-
-	for _, e := range allEnums {
-		enumSet[e.Name] = struct{}{}
-	}
-	for _, e := range allEntities {
-		entitySet[e.Name] = struct{}{}
-	}
-	for _, c := range allComplexes {
-		complexSet[c.Name] = struct{}{}
+		for _, en := range schema.EnumTypes {
+			seen := map[string]bool{}
+			vals := []string{}
+			for _, m := range en.Members {
+				if !seen[m.Name] {
+					seen[m.Name] = true
+					vals = append(vals, m.Name)
+				}
+			}
+			enumsByName[en.Name] = vals
+		}
 	}
 
 	// enums.ts
 	{
 		var b strings.Builder
-		b.WriteString("// Generated enums from OData EDMX for SAP Business One Service Layer v2\n")
+		b.WriteString("// Generated ArkType enums from OData EDMX for SAP Business One Service Layer v2\n")
 		b.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
 		b.WriteString(fmt.Sprintf("// Generated at %s\n\n", generatedAt))
-		b.WriteString("import { z } from 'zod';\n")
-		b.WriteString("const $z: any = z;\n\n")
+		b.WriteString(`import { type } from "arktype";` + "\n\n")
+
+		// stable order across schemas
+		var allEnums []EnumType
+		for _, schema := range edmx.DataServices.Schemas {
+			allEnums = append(allEnums, schema.EnumTypes...)
+		}
+		// sort by name for deterministic output
+		sort.Slice(allEnums, func(i, j int) bool { return allEnums[i].Name < allEnums[j].Name })
 
 		for _, en := range allEnums {
-			b.WriteString(generateZodEnum(en))
+			b.WriteString(generateArkEnum(en))
 		}
 
 		enumsPath := filepath.Join(outDir, "enums.ts")
@@ -623,15 +358,21 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 	if err := ensureDir(entityDir); err != nil {
 		return err
 	}
-	entityNames := make([]string, 0, len(allEntities))
-	for _, et := range allEntities {
-		fileName, content := renderPerTypeFile(et, true, entitySet, complexSet, enumSet, generatedAt)
-		target := filepath.Join(entityDir, fileName)
-		if err := writeFile(target, content); err != nil {
-			return fmt.Errorf("writing entity file %s: %w", target, err)
+	for _, schema := range edmx.DataServices.Schemas {
+		for _, et := range schema.EntityTypes {
+			var b strings.Builder
+			b.WriteString("// Generated ArkType entity from OData EDMX for SAP Business One Service Layer v2\n")
+			b.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
+			b.WriteString(fmt.Sprintf("// Generated at %s\n\n", generatedAt))
+			b.WriteString(`import { type } from "arktype";` + "\n\n")
+			b.WriteString(generateArkObject(et, enumsByName))
+
+			target := filepath.Join(entityDir, strings.Title(et.Name)+".ts")
+			if err := writeFile(target, b.String()); err != nil {
+				return fmt.Errorf("writing entity file %s: %w", target, err)
+			}
+			log.Printf("Wrote %s", target)
 		}
-		entityNames = append(entityNames, strings.TrimSuffix(fileName, ".ts"))
-		log.Printf("Wrote %s", target)
 	}
 
 	// complex
@@ -639,62 +380,77 @@ func writePerTypeOutputs(edmx *EDMX, outDir string) error {
 	if err := ensureDir(complexDir); err != nil {
 		return err
 	}
-	complexNames := make([]string, 0, len(allComplexes))
-	for _, ct := range allComplexes {
-		fileName, content := renderPerTypeFile(ct, false, entitySet, complexSet, enumSet, generatedAt)
-		target := filepath.Join(complexDir, fileName)
-		if err := writeFile(target, content); err != nil {
-			return fmt.Errorf("writing complex file %s: %w", target, err)
-		}
-		complexNames = append(complexNames, strings.TrimSuffix(fileName, ".ts"))
-		log.Printf("Wrote %s", target)
-	}
+	for _, schema := range edmx.DataServices.Schemas {
+		for _, ct := range schema.ComplexTypes {
+			var b strings.Builder
+			b.WriteString("// Generated ArkType complex type from OData EDMX for SAP Business One Service Layer v2\n")
+			b.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
+			b.WriteString(fmt.Sprintf("// Generated at %s\n\n", generatedAt))
+			b.WriteString(`import { type } from "arktype";` + "\n\n")
+			b.WriteString(generateArkObject(ct, enumsByName))
 
-	// barrels
-	{
-		sort.Strings(entityNames)
-		var b strings.Builder
-		b.WriteString("// Barrel file for entity schemas\n")
-		for _, n := range entityNames {
-			b.WriteString(fmt.Sprintf("export * from './%s';\n", n))
-		}
-		if err := writeFile(filepath.Join(entityDir, "index.ts"), b.String()); err != nil {
-			return err
-		}
-	}
-	{
-		sort.Strings(complexNames)
-		var b strings.Builder
-		b.WriteString("// Barrel file for complex schemas\n")
-		for _, n := range complexNames {
-			b.WriteString(fmt.Sprintf("export * from './%s';\n", n))
-		}
-		if err := writeFile(filepath.Join(complexDir, "index.ts"), b.String()); err != nil {
-			return err
-		}
-	}
-	{
-		var b strings.Builder
-		b.WriteString("// Root barrel file\n")
-		b.WriteString("export * from './enums';\n")
-		b.WriteString("export * from './entities';\n")
-		b.WriteString("export * from './complex';\n")
-		if err := writeFile(filepath.Join(outDir, "index.ts"), b.String()); err != nil {
-			return err
+			target := filepath.Join(complexDir, strings.Title(ct.Name)+".ts")
+			if err := writeFile(target, b.String()); err != nil {
+				return fmt.Errorf("writing complex file %s: %w", target, err)
+			}
+			log.Printf("Wrote %s", target)
 		}
 	}
 
+	// No barrels to avoid loading everything at once
 	return nil
 }
 
-// ---------------------- main ----------------------
+func writeSingleFile(edmx *EDMX, outputFile string) error {
+	var out strings.Builder
+	out.WriteString("// Generated ArkType types from OData EDMX for SAP Business One Service Layer v2\n")
+	out.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
+	out.WriteString(fmt.Sprintf("// Generated at %s\n\n", time.Now().Format(time.RFC3339)))
+	out.WriteString(`import { type } from "arktype";` + "\n\n")
+
+	// enums map for props
+	enumsByName := map[string][]string{}
+	for _, schema := range edmx.DataServices.Schemas {
+		for _, en := range schema.EnumTypes {
+			seen := map[string]bool{}
+			vals := []string{}
+			for _, m := range en.Members {
+				if !seen[m.Name] {
+					seen[m.Name] = true
+					vals = append(vals, m.Name)
+				}
+			}
+			enumsByName[en.Name] = vals
+		}
+	}
+
+	// Enums
+	for _, schema := range edmx.DataServices.Schemas {
+		for _, en := range schema.EnumTypes {
+			out.WriteString(generateArkEnum(en))
+		}
+	}
+
+	// Entities and Complex
+	for _, schema := range edmx.DataServices.Schemas {
+		for _, et := range schema.EntityTypes {
+			out.WriteString(generateArkObject(et, enumsByName))
+		}
+		for _, ct := range schema.ComplexTypes {
+			out.WriteString(generateArkObject(ct, enumsByName))
+		}
+	}
+
+	return ioutil.WriteFile(outputFile, []byte(out.String()), 0644)
+}
+
+// ========================= main =========================
 
 func main() {
 	inputFile := flag.String("input", "", "Path to the EDMX XML file")
 	outputFile := flag.String("output", "types.ts", "Path to the output TS file for -split=single")
 	outDir := flag.String("outDir", "types", "Directory to write TS files for -split=perType")
 	splitMode := flag.String("split", "perType", "Output mode: single | perType")
-	dumpParsed := flag.Bool("dump", false, "Dump parsed XML structure to debug.xml")
 	flag.Parse()
 
 	if *inputFile == "" {
@@ -714,89 +470,18 @@ func main() {
 	log.Printf("Parsed EDMX Version: %s", edmx.Version)
 	log.Printf("Parsed %d schemas", len(edmx.DataServices.Schemas))
 
-	if *dumpParsed {
-		dumpParsedXML(&edmx, "debug.xml")
-	}
-
 	switch *splitMode {
 	case "single":
-		var output strings.Builder
-		output.WriteString("// Generated Zod schemas from OData EDMX for SAP Business One Service Layer v2\n")
-		output.WriteString("// DO NOT EDIT - Regenerate from metadata.\n")
-		output.WriteString(fmt.Sprintf("// Generated at %s\n\n", time.Now().Format(time.RFC3339)))
-		output.WriteString("import { z, ZodType } from 'zod';\n")
-		output.WriteString("const $z: any = z;\n\n")
-
-		// Enums first
-		allEnums := make(map[string]string)
-		for i, schema := range edmx.DataServices.Schemas {
-			for _, en := range schema.EnumTypes {
-				enumCode := generateZodEnum(en)
-				allEnums[en.Name] = enumCode
-				log.Printf("  Pre-generated EnumType: %s (schema %d)", en.Name, i+1)
-			}
+		if err := writeSingleFile(&edmx, *outputFile); err != nil {
+			log.Fatalf("Error writing single output file: %v", err)
 		}
-		for _, enumCode := range allEnums {
-			output.WriteString(enumCode)
-		}
-
-		// Models next
-		for _, schema := range edmx.DataServices.Schemas {
-			for _, et := range schema.EntityTypes {
-				output.WriteString(generateTsModelType(et))
-			}
-			for _, ct := range schema.ComplexTypes {
-				output.WriteString(generateTsModelType(ct))
-			}
-		}
-
-		// Schemas last
-		generatedCount := len(allEnums)
-		for i, schema := range edmx.DataServices.Schemas {
-			log.Printf("Processing schema %d: %s (Alias: %s)", i+1, schema.Namespace, schema.Alias)
-			log.Printf("  - %d EntityTypes", len(schema.EntityTypes))
-			log.Printf("  - %d ComplexTypes", len(schema.ComplexTypes))
-
-			for _, et := range schema.EntityTypes {
-				output.WriteString(generateZodSchema(et, true, schema.Namespace))
-				generatedCount++
-				log.Printf("  Generated EntityType Schema: %s", et.Name)
-			}
-			for _, ct := range schema.ComplexTypes {
-				output.WriteString(generateZodSchema(ct, false, schema.Namespace))
-				generatedCount++
-				log.Printf("  Generated ComplexType Schema: %s", ct.Name)
-			}
-		}
-
-		if generatedCount == 0 {
-			log.Println("Warning: No types generated.")
-			output.WriteString("// No schemas found in metadata.\n")
-		} else {
-			log.Printf("Successfully generated %d schemas (including %d enums)", generatedCount, len(allEnums))
-		}
-
-		err = ioutil.WriteFile(*outputFile, []byte(output.String()), 0644)
-		if err != nil {
-			log.Fatalf("Error writing output file: %v", err)
-		}
-		log.Printf("Generated Zod schemas in %s", *outputFile)
-
+		log.Printf("Generated ArkType types in %s", *outputFile)
 	case "perType":
 		if err := writePerTypeOutputs(&edmx, *outDir); err != nil {
 			log.Fatalf("Error generating per-type outputs: %v", err)
 		}
-		log.Printf("Generated per-type TS files in %s", *outDir)
-
+		log.Printf("Generated per-type ArkType TS files in %s", *outDir)
 	default:
 		log.Fatalf("Unknown -split mode: %s (use 'single' or 'perType')", *splitMode)
 	}
 }
-
-// ---------------------- Notes ----------------------
-// - Fast-LSP mode removes z.infer usage for exported types and casts Zod initializers,
-//   drastically reducing TypeScript's type-checking work.
-// - Dates are parsed with $z.coerce.date() and fields are .nullish().
-// - Enums are emitted as string unions plus $z.enum([...]) schemas.
-// - Aliases: For any property ending with "Property", the schema accepts the alias
-//   (without "Property") in the payload and copies it to the canonical key before validation.
